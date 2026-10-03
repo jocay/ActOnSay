@@ -36,6 +36,7 @@ import androidx.compose.ui.unit.dp
 import com.voice.actonsay.asr.AsrManager
 import com.voice.actonsay.ui.components.SectionCard
 import com.voice.actonsay.ui.components.SettingHint
+import com.voice.actonsay.ui.components.SettingSwitchRow
 import com.voice.actonsay.ui.icons.AppIcons
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -43,6 +44,7 @@ import com.voice.actonsay.ui.icons.AppIcons
 fun WakeWordSettingsScreen(onBack: () -> Unit) {
     val state by AsrManager.state.collectAsState()
     var input by rememberSaveable { mutableStateOf("") }
+    var interruptInput by rememberSaveable { mutableStateOf("") }
 
     fun add() {
         val w = input.trim()
@@ -99,6 +101,73 @@ fun WakeWordSettingsScreen(onBack: () -> Unit) {
                 }
                 SettingHint("点击标签即可移除。")
             }
+        }
+
+        SectionCard(title = "唤醒应答") {
+            SettingSwitchRow(
+                title = "唤醒后先语音应答",
+                subtitle = "听到唤醒词立即回一句“我在”，应答播完再开始收音；点击麦克风唤醒不应答。需开启语音播报",
+                checked = state.wakeAckEnabled,
+                onCheckedChange = { AsrManager.setWakeAck(it) }
+            )
+            SettingSwitchRow(
+                title = "连续对话",
+                subtitle = "语音提问的回答播完后自动再听 5 秒，接着说就行，不用再喊唤醒词",
+                checked = state.followUpEnabled,
+                onCheckedChange = { AsrManager.setVoiceExperience(it, state.progressNarration, state.announceBackground) }
+            )
+            SettingSwitchRow(
+                title = "进度播报",
+                subtitle = "语音提问后 AI 较久没出声时，播一句当前在做什么",
+                checked = state.progressNarration,
+                onCheckedChange = { AsrManager.setVoiceExperience(state.followUpEnabled, it, state.announceBackground) }
+            )
+            SettingSwitchRow(
+                title = "后台任务完成时通报",
+                subtitle = "后台任务完成说一声；定时任务直接念出结果（多为提醒）",
+                checked = state.announceBackground,
+                onCheckedChange = { AsrManager.setVoiceExperience(state.followUpEnabled, state.progressNarration, it) }
+            )
+        }
+
+        SectionCard(title = "打断词") {
+            SettingHint("AI 说话、干活或放歌时说出打断词，会立即停下来听你说；正在执行的任务继续。唤醒词在播报时同样能打断。播报内容里恰好含有这个词时会被忽略。")
+            Row(
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    value = interruptInput,
+                    onValueChange = { interruptInput = it },
+                    modifier = Modifier.weight(1f),
+                    placeholder = { Text("如：等一下") },
+                    singleLine = true,
+                    shape = MaterialTheme.shapes.medium
+                )
+                Spacer(Modifier.width(10.dp))
+                FilledIconButton(onClick = {
+                    val word = interruptInput.trim()
+                    if (word.isNotEmpty()) { AsrManager.setInterruptWords(state.interruptWords + word); interruptInput = "" }
+                }, enabled = interruptInput.isNotBlank()) {
+                    Icon(Icons.Default.Add, contentDescription = "添加打断词")
+                }
+            }
+            FlowRow(
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                state.interruptWords.sorted().forEach { word ->
+                    InputChip(
+                        selected = true,
+                        onClick = { AsrManager.setInterruptWords(state.interruptWords - word) },
+                        label = { Text(word) },
+                        trailingIcon = { Icon(Icons.Default.Close, contentDescription = "移除 $word", modifier = Modifier.size(16.dp)) },
+                        shape = CircleShape
+                    )
+                }
+            }
+            if (state.interruptWords.isEmpty()) SettingHint("没有打断词时只有唤醒词能打断播报。")
         }
 
         SectionCard(title = "识别提示") {

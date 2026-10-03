@@ -2,6 +2,7 @@ package com.voice.actonsay.agent
 
 import android.content.Context
 import android.util.Log
+import com.voice.actonsay.asr.AsrManager
 
 /**
  * 专用设备加固：让本应用不受后台联网/省电策略限制。
@@ -16,7 +17,7 @@ object DeviceHardening {
     private var applied = false
 
     fun applyIfPossible(context: Context) {
-        if (applied || !RootShell.hasRoot) return
+        if (applied || !RootShell.hasRoot || !AsrManager.state.value.androidRootAllowed) return
         applied = true
         val pkg = context.packageName
         val commands = listOf(

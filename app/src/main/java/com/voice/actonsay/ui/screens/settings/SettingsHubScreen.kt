@@ -36,7 +36,7 @@ import com.voice.actonsay.ui.components.SectionCard
 import com.voice.actonsay.ui.components.SettingNavRow
 import com.voice.actonsay.ui.icons.AppIcons
 
-enum class SettingsPage { AI, ASR, TTS, WAKE_WORDS, APPEARANCE, ABOUT }
+enum class SettingsPage { AI, ASR, TTS, WAKE_WORDS, APPEARANCE, ABOUT, EXECUTION, MCP, SKILLS, PERMISSIONS, MEMORY, WEB }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -84,7 +84,7 @@ fun SettingsHubScreen(onOpen: (SettingsPage) -> Unit) {
                     StatusLine(
                         ok = state.ttsEnabled,
                         label = "语音播报",
-                        detail = if (!state.ttsEnabled) "已关闭" else if (state.ttsEngine == TtsEngineType.MIMO) "MiMo · ${state.mimoVoice}" else "系统引擎"
+                        detail = if (!state.ttsEnabled) "已关闭" else when (state.ttsEngine) { TtsEngineType.MIMO -> "MiMo · ${state.mimoVoice}"; TtsEngineType.LOCAL -> "本地离线"; else -> "系统引擎" }
                     )
                 }
             }
@@ -106,7 +106,7 @@ fun SettingsHubScreen(onOpen: (SettingsPage) -> Unit) {
                 )
                 SettingNavRow(
                     title = "语音播报",
-                    subtitle = if (!state.ttsEnabled) "已关闭" else if (state.ttsEngine == TtsEngineType.MIMO) "小米 MiMo 拟人语音" else "系统 TextToSpeech",
+                    subtitle = if (!state.ttsEnabled) "已关闭" else when (state.ttsEngine) { TtsEngineType.MIMO -> "小米 MiMo 拟人语音"; TtsEngineType.LOCAL -> "本地离线模型"; else -> "系统 TextToSpeech" },
                     icon = AppIcons.RecordVoice,
                     iconTint = scheme.onTertiaryContainer,
                     iconBackground = scheme.tertiaryContainer,
@@ -118,6 +118,15 @@ fun SettingsHubScreen(onOpen: (SettingsPage) -> Unit) {
                     icon = AppIcons.Hearing,
                     onClick = { onOpen(SettingsPage.WAKE_WORDS) }
                 )
+            }
+
+            SectionCard(title = "执行与扩展") {
+                SettingNavRow("Debian 执行环境", "容器、配对、部署向导与首次检查", AppIcons.Terminal, onClick = { onOpen(SettingsPage.EXECUTION) })
+                SettingNavRow("联网、搜索与音乐", "搜索密钥、音乐解析和可选代理", AppIcons.Language, onClick = { onOpen(SettingsPage.WEB) })
+                SettingNavRow("MCP 服务", "stdio、HTTP、工具、资源与提示词", AppIcons.Extension, onClick = { onOpen(SettingsPage.MCP) })
+                SettingNavRow("Skills", "导入、按需加载与版本管理", AppIcons.Skill, onClick = { onOpen(SettingsPage.SKILLS) })
+                SettingNavRow("权限与任务预算", "Android Root、Debian 执行和高度自主模式", AppIcons.Key, onClick = { onOpen(SettingsPage.PERMISSIONS) })
+                SettingNavRow("长期偏好与项目备注", "明确记住后用于后续任务", AppIcons.History, onClick = { onOpen(SettingsPage.MEMORY) })
             }
 
             SectionCard(title = "通用") {

@@ -38,6 +38,7 @@ import androidx.compose.ui.unit.dp
 import com.voice.actonsay.agent.ToolRegistry
 import com.voice.actonsay.ai.OpenAiClient
 import com.voice.actonsay.asr.AsrManager
+import com.voice.actonsay.ai.FastDecisionClient
 import com.voice.actonsay.ui.components.FieldSpacer
 import com.voice.actonsay.ui.components.SecretTextField
 import com.voice.actonsay.ui.components.SectionCard
@@ -58,6 +59,10 @@ fun AiSettingsScreen(onBack: () -> Unit) {
     var model by remember(state.aiModel) { mutableStateOf(state.aiModel) }
     var prompt by remember(state.aiSystemPrompt) { mutableStateOf(state.aiSystemPrompt) }
 
+    var fastKey by remember(state.fastDecisionApiKey) { mutableStateOf(state.fastDecisionApiKey) }
+    var fastTesting by remember { mutableStateOf(false) }
+    var fastTest by remember { mutableStateOf<Pair<Boolean, String>?>(null) }
+
     var testing by remember { mutableStateOf(false) }
     var testResult by remember { mutableStateOf<Pair<Boolean, String>?>(null) }
 
@@ -67,7 +72,7 @@ fun AiSettingsScreen(onBack: () -> Unit) {
         SectionCard {
             SettingSwitchRow(
                 title = "启用 AI 回复",
-                subtitle = "识别完成后把文本交给大模型，并把回答播报出来",
+                subtitle = "识别完成后交给大模型；屏幕显示完整回答，语音播报简短摘要",
                 checked = state.aiEnabled,
                 onCheckedChange = { AsrManager.setAiEnabled(it) },
                 icon = AppIcons.Robot
@@ -181,7 +186,7 @@ fun AiSettingsScreen(onBack: () -> Unit) {
         SectionCard(title = "对话行为") {
             SettingSwitchRow(
                 title = "流式输出",
-                subtitle = "回复逐字显示，体感更快；播报仍在全文生成后开始",
+                subtitle = "回复逐字显示；生成完成后播报简短摘要，完整回答保留在屏幕",
                 checked = state.aiStreaming,
                 onCheckedChange = { AsrManager.setAiBehavior(it, state.aiContextTurns) }
             )
@@ -210,8 +215,14 @@ fun AiSettingsScreen(onBack: () -> Unit) {
 
         SectionCard(title = "智能体") {
             SettingSwitchRow(
+                title = "模型支持图像输入",
+                subtitle = "按所用模型能力开启，将 MCP 图片产物传入模型；默认仅在应用展示图片",
+                checked = state.aiVisionEnabled,
+                onCheckedChange = { AsrManager.setAiVisionEnabled(it) }
+            )
+            SettingSwitchRow(
                 title = "允许调用工具",
-                subtitle = "让 AI 在本机执行命令、打开应用、读取屏幕，把说的话真正做成事",
+                subtitle = "由 AI 自己决定直接回答、调用工具还是创建后台任务；关闭后只做纯聊天",
                 checked = state.agentEnabled,
                 onCheckedChange = { AsrManager.setAgentEnabled(it) },
                 icon = AppIcons.Bolt
@@ -236,6 +247,46 @@ fun AiSettingsScreen(onBack: () -> Unit) {
                 TextButton(onClick = { AsrManager.refreshRootStatus(force = true) }) { Text("重新检测") }
             }
             SettingHint("内置工具：" + ToolRegistry.all().joinToString("、") { it.name } + "。模型需要支持 function calling（DeepSeek、GPT、Qwen 均可）。")
+        }
+
+        SectionCard(title = "快速决策模型") {
+            SettingSwitchRow(
+                title = "让 AI 判断新消息如何处理",
+                subtitle = "上一条还在处理时又来新消息：由 Jev 判断是打断、补充还是排队。关闭或未填密钥时一律排队",
+                checked = state.fastDecisionEnabled,
+                onCheckedChange = { AsrManager.setFastDecision(it, fastKey) }
+            )
+            Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                SecretTextField(
+                    value = fastKey,
+                    onValueChange = { fastKey = it; fastTest = null; AsrManager.setFastDecision(state.fastDecisionEnabled, it) },
+                    label = "TypeSafe API Key",
+                    placeholder = "apikey_…"
+                )
+                FieldSpacer()
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(
+                        enabled = !fastTesting && fastKey.isNotBlank(),
+                        onClick = {
+                            fastTesting = true
+                            fastTest = null
+                            scope.launch {
+                                val result = FastDecisionClient.test(fastKey)
+                                fastTesting = false
+                                fastTest = result.fold(onSuccess = { true to it }, onFailure = { false to (it.localizedMessage ?: "未知错误") })
+                            }
+                        }
+                    ) { Text(if (fastTesting) "测试中…" else "测试连接") }
+                    fastTest?.let { (ok, msg) ->
+                        Text(
+                            msg,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (ok) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+                        )
+                    }
+                }
+            }
+            SettingHint("TypeSafe Jev 只做选择和是非判断，不生成文字，单次约半秒。判断失败、超时或不够确定时自动退回排队，不影响对话。")
         }
 
         SectionCard(title = "系统提示词") {

@@ -11,6 +11,7 @@ import android.content.pm.ServiceInfo
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
@@ -49,6 +50,7 @@ class AsrService : Service() {
     }
 
     private var audioRecord: AudioRecord? = null
+    private var echoCanceler: AcousticEchoCanceler? = null
     private var recordingThread: Thread? = null
     @Volatile
     private var isRecording = false
@@ -144,6 +146,10 @@ class AsrService : Service() {
 
         isRecording = true
         AsrManager.setListening(true)
+        // 播报时要监听打断词：开启系统回声消除（设备支持时），降低扬声器声音被当成用户说话的概率。
+        echoCanceler = audioRecord?.audioSessionId?.takeIf { AcousticEchoCanceler.isAvailable() }
+            ?.let { session -> runCatching { AcousticEchoCanceler.create(session)?.apply { enabled = true } }.getOrNull() }
+        Log.i(TAG, "Echo canceler: ${if (echoCanceler?.enabled == true) "enabled" else "unavailable"}")
         audioRecord?.startRecording()
 
         recordingThread = Thread {
@@ -186,6 +192,8 @@ class AsrService : Service() {
             audioRecord?.stop()
         } catch (_: IllegalStateException) {
         }
+        echoCanceler?.release()
+        echoCanceler = null
         audioRecord?.release()
         audioRecord = null
     }

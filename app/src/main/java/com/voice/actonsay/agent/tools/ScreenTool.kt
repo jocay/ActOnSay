@@ -4,6 +4,9 @@ import android.util.Xml
 import com.voice.actonsay.agent.AgentTool
 import com.voice.actonsay.agent.RootShell
 import com.voice.actonsay.agent.ToolContext
+import com.voice.actonsay.agent.ToolResult
+import com.voice.actonsay.agent.DeviceOperationGate
+import com.voice.actonsay.agent.ExecutionEnvironment
 import com.voice.actonsay.agent.schemaObject
 import com.voice.actonsay.agent.schemaProp
 import com.voice.actonsay.agent.truncateOutput
@@ -26,8 +29,8 @@ class ScreenContentTool : AgentTool {
         "max_items" to schemaProp("integer", "最多返回的控件条数，默认 120", default = 120)
     )
 
-    override suspend fun execute(args: JSONObject, ctx: ToolContext): String {
-        if (!RootShell.hasRoot) return "需要 root 权限才能读取屏幕内容"
+    override suspend fun execute(args: JSONObject, ctx: ToolContext): ToolResult = DeviceOperationGate.run {
+        if (!ctx.requireAndroidRoot()) return@run ToolResult.failure("需要 root 权限才能读取屏幕内容", "ROOT_UNAVAILABLE")
         val maxItems = args.optInt("max_items", 120).coerceIn(10, 400)
         ctx.onProgress("读取屏幕内容")
 
@@ -40,7 +43,7 @@ class ScreenContentTool : AgentTool {
         }
         val xml = dump.stdout
         if (!xml.contains("<hierarchy")) {
-            return "读取屏幕失败：${dump.render(600)}"
+            return@run ToolResult.failure("读取屏幕失败：${dump.render(600)}")
         }
 
         val lines = parseNodes(xml, maxItems)
@@ -52,7 +55,7 @@ class ScreenContentTool : AgentTool {
             sb.append("控件（格式：文本 [描述] {resource-id} 类型 @中心坐标 标记）：\n")
             lines.forEach { sb.append(it).append('\n') }
         }
-        return truncateOutput(sb.toString().trimEnd(), 10_000)
+        ToolResult.success(truncateOutput(sb.toString().trimEnd(), 10_000))
     }
 
     private fun parseNodes(xml: String, maxItems: Int): List<String> {

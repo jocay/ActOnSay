@@ -7,6 +7,9 @@ import android.util.Log
 import com.voice.actonsay.agent.AgentTool
 import com.voice.actonsay.agent.RootShell
 import com.voice.actonsay.agent.ToolContext
+import com.voice.actonsay.agent.ToolResult
+import com.voice.actonsay.agent.DeviceOperationGate
+import com.voice.actonsay.agent.ExecutionEnvironment
 import com.voice.actonsay.agent.schemaObject
 import com.voice.actonsay.agent.schemaProp
 import kotlinx.coroutines.Dispatchers
@@ -53,16 +56,16 @@ class ListAppsTool : AgentTool {
         "limit" to schemaProp("integer", "最多返回条数，默认 60", default = 60)
     )
 
-    override suspend fun execute(args: JSONObject, ctx: ToolContext): String = withContext(Dispatchers.IO) {
+    override suspend fun execute(args: JSONObject, ctx: ToolContext): ToolResult = withContext(Dispatchers.IO) {
         val query = args.optString("query").trim()
         val limit = args.optInt("limit", 60).coerceIn(1, 400)
         val apps = listLaunchableApps(ctx.context)
             .filter { query.isEmpty() || it.label.contains(query, true) || it.packageName.contains(query, true) }
-        if (apps.isEmpty()) return@withContext "没有找到匹配的应用"
+        if (apps.isEmpty()) return@withContext ToolResult.success("没有找到匹配的应用")
         val sb = StringBuilder()
         apps.take(limit).forEach { sb.append(it.label).append("  (").append(it.packageName).append(if (it.system) ", 系统" else "").append(")\n") }
         if (apps.size > limit) sb.append("…共 ${apps.size} 个，只显示前 $limit 个\n")
-        sb.toString().trimEnd()
+        ToolResult.success(sb.toString().trimEnd())
     }
 }
 
@@ -74,31 +77,31 @@ class OpenAppTool : AgentTool {
         required = listOf("app")
     )
 
-    override suspend fun execute(args: JSONObject, ctx: ToolContext): String {
+    override suspend fun execute(args: JSONObject, ctx: ToolContext): ToolResult = DeviceOperationGate.run {
         val query = args.optString("app").trim()
         val app = withContext(Dispatchers.IO) { resolveApp(ctx.context, query) }
-            ?: return "没有找到叫“$query”的应用，可先用 list_apps 查找"
+            ?: return@run ToolResult.failure("没有找到叫“$query”的应用，可先用 list_apps 查找", "APP_NOT_FOUND")
         ctx.onProgress("打开 ${app.label}")
         val pm = ctx.context.packageManager
         val intent = pm.getLaunchIntentForPackage(app.packageName)
-            ?: return "应用 ${app.label} 没有可启动的入口"
+            ?: return@run ToolResult.failure("应用 ${app.label} 没有可启动的入口", "APP_NOT_LAUNCHABLE")
         val component = intent.component
 
         // 前台服务在后台启动 Activity 会被系统拦截，root 可用时优先走 am start
-        if (RootShell.hasRoot && component != null) {
+        if (component != null && ctx.requireAndroidRoot()) {
             val cmd = "am start -n ${component.flattenToShortString()} -a android.intent.action.MAIN -c android.intent.category.LAUNCHER"
             val r = runInterruptible(Dispatchers.IO) { RootShell.exec(cmd, timeoutMs = 10_000) }
             if (r.exitCode == 0 && !r.stdout.contains("Error", true) && !r.stderr.contains("Error", true)) {
-                return "已打开 ${app.label} (${app.packageName})"
+                return@run ToolResult.success("已打开 ${app.label} (${app.packageName})")
             }
             Log.w(TAG, "am start failed, fallback to startActivity: ${r.render(500)}")
         }
-        return try {
+        try {
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             ctx.context.startActivity(intent)
-            "已尝试打开 ${app.label} (${app.packageName})"
+            ToolResult.success("已尝试打开 ${app.label} (${app.packageName})")
         } catch (e: Exception) {
-            "打开 ${app.label} 失败：${e.message}"
+            ToolResult.failure("打开 ${app.label} 失败：${e.message}")
         }
     }
 }

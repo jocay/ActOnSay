@@ -100,6 +100,7 @@ import com.voice.actonsay.asr.AsrState
 import com.voice.actonsay.asr.ChatMessage
 import com.voice.actonsay.asr.EngineState
 import com.voice.actonsay.tts.TtsManager
+import com.voice.actonsay.tasks.CredentialRedactor
 import com.voice.actonsay.ui.components.ChatBubble
 import com.voice.actonsay.ui.components.LevelBars
 import com.voice.actonsay.ui.components.VoiceOrb
@@ -123,7 +124,8 @@ private val SUGGESTIONS = listOf(
 fun HomeScreen(
     onOpenSettings: () -> Unit,
     onOpenAiSettings: () -> Unit,
-    onOpenAsrSettings: () -> Unit
+    onOpenAsrSettings: () -> Unit,
+    onOpenTasks: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val asrState by AsrManager.state.collectAsState()
@@ -191,7 +193,7 @@ fun HomeScreen(
     fun share(text: String) {
         val intent = Intent(Intent.ACTION_SEND).apply {
             type = "text/plain"
-            putExtra(Intent.EXTRA_TEXT, text)
+            putExtra(Intent.EXTRA_TEXT, CredentialRedactor.text(text))
         }
         context.startActivity(Intent.createChooser(intent, "分享"))
     }
@@ -202,7 +204,7 @@ fun HomeScreen(
             val who = if (m.role == "user") "我" else "助手"
             "[$who · ${df.format(Date(m.timestamp))}]\n${m.content}"
         }
-        share(text)
+        share(CredentialRedactor.text(text))
     }
 
     if (showClearDialog) {
@@ -342,11 +344,12 @@ fun HomeScreen(
                         } else null
                         ChatBubble(
                             message = msg,
-                            onReplayTts = { TtsManager.speak(msg.content) },
+                            onReplayTts = { TtsManager.speak(if (msg.content.length > 400) msg.content.take(400) + "。完整内容请查看屏幕。" else msg.content) },
                             onCopyText = { copy(msg.content) },
                             onShare = { share(msg.content) },
                             onDelete = { AsrManager.deleteMessage(msg.id) },
-                            onRetry = prevUser?.let { u -> { AsrManager.retryMessage(u.id) } }
+                            onRetry = prevUser?.let { u -> { AsrManager.retryMessage(u.id) } },
+                            onOpenTasks = onOpenTasks
                         )
                     }
                     if (asrState.engineState == EngineState.ACTIVE_LISTENING && asrState.currentText.isNotBlank()) {

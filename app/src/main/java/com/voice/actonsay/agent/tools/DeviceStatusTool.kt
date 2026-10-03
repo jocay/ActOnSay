@@ -12,6 +12,7 @@ import android.os.PowerManager
 import com.voice.actonsay.agent.AgentTool
 import com.voice.actonsay.agent.RootShell
 import com.voice.actonsay.agent.ToolContext
+import com.voice.actonsay.agent.ToolResult
 import com.voice.actonsay.agent.schemaObject
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -26,7 +27,7 @@ class DeviceStatusTool : AgentTool {
     override val description = "获取设备当前状态：日期时间、电量与充电状态、网络连接类型、媒体/铃声音量、屏幕是否点亮、可用内存、是否有 root。回答“几点了 / 还有多少电 / 有没有联网”这类问题时直接用它，不要去翻 shell。"
     override val parameters = schemaObject()
 
-    override suspend fun execute(args: JSONObject, ctx: ToolContext): String = withContext(Dispatchers.IO) {
+    override suspend fun execute(args: JSONObject, ctx: ToolContext): ToolResult = withContext(Dispatchers.IO) {
         val c = ctx.context
         val sb = StringBuilder()
         sb.append("时间: ").append(SimpleDateFormat("yyyy-MM-dd EEEE HH:mm:ss", Locale.CHINA).format(Date())).append('\n')
@@ -38,7 +39,7 @@ class DeviceStatusTool : AgentTool {
         sb.append("屏幕: ").append(if (pm?.isInteractive == true) "点亮" else "熄灭").append('\n')
         sb.append(runCatching { memoryLine(c) }.getOrElse { "memoryLine: 读取失败 ${it.message}" }).append('\n')
         sb.append("root: ").append(if (RootShell.hasRoot) "已授权" else "未授权")
-        sb.toString()
+        ToolResult.success(sb.toString())
     }
 
     private fun batteryLine(c: Context): String {

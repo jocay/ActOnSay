@@ -38,6 +38,10 @@ import com.voice.actonsay.asr.AsrManager
 import com.voice.actonsay.tts.MimoTtsClient
 import com.voice.actonsay.tts.TtsEngineType
 import com.voice.actonsay.tts.TtsManager
+import com.voice.actonsay.tts.LocalTts
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.platform.LocalContext
+import kotlinx.coroutines.launch
 import com.voice.actonsay.ui.components.FieldSpacer
 import com.voice.actonsay.ui.components.SecretTextField
 import com.voice.actonsay.ui.components.SectionCard
@@ -57,40 +61,81 @@ fun TtsSettingsScreen(onBack: () -> Unit) {
     var rate by remember(state.ttsSpeechRate) { mutableStateOf(state.ttsSpeechRate) }
     var pitch by remember(state.ttsPitch) { mutableStateOf(state.ttsPitch) }
 
+    val localInstalled by LocalTts.installed.collectAsState()
+    val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+    var downloading by remember { mutableStateOf(false) }
+    var downloaded by remember { mutableStateOf(0L) }
+    var downloadMessage by remember { mutableStateOf("") }
+
     fun commitMimo() = AsrManager.setMimoConfig(mimoKey, state.mimoVoice, style)
 
     SubPageScaffold(title = "语音播报", onBack = { commitMimo(); onBack() }) {
         SectionCard {
             SettingSwitchRow(
                 title = "启用语音播报",
-                subtitle = "AI 回复完成后自动朗读；播报期间暂停拾音防止回声",
+                subtitle = "回复边生成边分句朗读，可随时打断；后台任务结果默认不朗读",
                 checked = state.ttsEnabled,
                 onCheckedChange = { AsrManager.setTtsEnabled(it) },
                 icon = AppIcons.VolumeUp
+            )
+            SettingSwitchRow(
+                title = "朗读完整回复",
+                subtitle = "关闭后只朗读前 160 字，完整内容仍在屏幕上；表格和代码块始终不读",
+                checked = state.ttsFullReply,
+                onCheckedChange = { AsrManager.setTtsFullReply(it) }
             )
         }
 
         SectionCard(title = "合成引擎") {
             SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
-                SegmentedButton(
-                    selected = state.ttsEngine == TtsEngineType.MIMO,
-                    onClick = { AsrManager.setTtsEngine(TtsEngineType.MIMO) },
-                    shape = SegmentedButtonDefaults.itemShape(0, 2),
-                    label = { Text("MiMo 在线") }
-                )
-                SegmentedButton(
-                    selected = state.ttsEngine == TtsEngineType.SYSTEM,
-                    onClick = { AsrManager.setTtsEngine(TtsEngineType.SYSTEM) },
-                    shape = SegmentedButtonDefaults.itemShape(1, 2),
-                    label = { Text("系统离线") }
-                )
+                listOf(TtsEngineType.MIMO to "MiMo 在线", TtsEngineType.LOCAL to "本地离线", TtsEngineType.SYSTEM to "系统引擎").forEachIndexed { index, (engine, label) ->
+                    SegmentedButton(
+                        selected = state.ttsEngine == engine,
+                        onClick = { AsrManager.setTtsEngine(engine) },
+                        shape = SegmentedButtonDefaults.itemShape(index, 3),
+                        label = { Text(label) }
+                    )
+                }
             }
             SettingHint(
-                if (state.ttsEngine == TtsEngineType.MIMO)
-                    "小米 MiMo 拟人大模型语音，音质自然、支持情感风格；网络异常时自动回退到系统引擎。"
-                else
-                    "使用 Android 系统自带 TextToSpeech，无需联网，音色取决于设备已安装的语音包。"
+                when (state.ttsEngine) {
+                    TtsEngineType.MIMO -> "小米 MiMo 拟人大模型语音，音质自然、支持情感风格；分段并行合成。请求失败时该段自动改用本地离线模型。"
+                    TtsEngineType.LOCAL -> "应用内置的 sherpa-onnx 离线模型（中文女声），无需联网、出声最快，音质不如云端；语速沿用下方系统引擎的设置。"
+                    TtsEngineType.SYSTEM -> "使用 Android 系统自带 TextToSpeech，无需联网，音色取决于设备已安装的语音包。"
+                }
             )
+        }
+
+        SectionCard(title = "本地离线模型") {
+            SettingHint(
+                if (localInstalled) "已安装 matcha-icefall-zh-baker。云端合成失败时自动用它兜底，也可作为主引擎。"
+                else "尚未安装。下载约 ${LocalTts.totalBytes / (1024 * 1024)} MB 到应用私有目录，之后云端失败时自动兜底，也可作为主引擎。"
+            )
+            Row(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                OutlinedButton(
+                    enabled = !downloading && !localInstalled,
+                    onClick = {
+                        downloading = true
+                        downloadMessage = ""
+                        scope.launch {
+                            downloadMessage = runCatching {
+                                LocalTts.download(context.applicationContext) { done -> downloaded = done }
+                                "下载完成"
+                            }.getOrElse { "下载失败：${it.message}，可再次点击继续" }
+                            downloading = false
+                        }
+                    }
+                ) {
+                    Text(when {
+                        localInstalled -> "已安装"
+                        downloading -> "下载中 ${downloaded * 100 / LocalTts.totalBytes}%"
+                        else -> "下载模型"
+                    })
+                }
+                Spacer(Modifier.width(10.dp))
+                Text(downloadMessage, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
         }
 
         if (state.ttsEngine == TtsEngineType.MIMO) {
@@ -100,7 +145,7 @@ fun TtsSettingsScreen(onBack: () -> Unit) {
                         value = mimoKey,
                         onValueChange = { mimoKey = it; commitMimo() },
                         label = "MiMo API Key",
-                        supportingText = "留空则使用内置体验密钥（额度有限，建议填写自己的）"
+                        supportingText = "填写自己的 MiMo API Key；留空时使用本地离线模型或系统 TTS。"
                     )
                     FieldSpacer()
                     Text("音色", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)

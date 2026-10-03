@@ -15,6 +15,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Share
+import android.content.Intent
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -123,6 +125,16 @@ fun AboutScreen(onBack: () -> Unit) {
         }
 
         SectionCard(title = "数据管理") {
+            SettingNavRow(
+                title = "导出配置（已脱敏）",
+                subtitle = "凭据只显示是否已配置，可用于排查与备份设置说明",
+                icon = Icons.Default.Share,
+                onClick = {
+                    val intent = Intent(Intent.ACTION_SEND).setType("text/plain")
+                        .putExtra(Intent.EXTRA_TEXT, AsrManager.exportConfigRedacted())
+                    context.startActivity(Intent.createChooser(intent, "导出配置"))
+                }
+            )
             SettingNavRow(
                 title = "清空对话与命中记录",
                 subtitle = "删除本机保存的全部历史",

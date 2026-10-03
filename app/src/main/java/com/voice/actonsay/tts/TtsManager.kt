@@ -7,31 +7,43 @@ import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import java.io.File
-import java.io.FileOutputStream
 import java.util.Locale
 import java.util.UUID
 
 enum class TtsEngineType {
     MIMO,       // 小米 MiMo 拟人大模型语音合成 (在线高保真)
-    SYSTEM      // 系统原生 TextToSpeech (离线原生)
+    SYSTEM,     // 系统原生 TextToSpeech (离线原生)
+    LOCAL       // 应用内置的 sherpa-onnx 离线模型（需先下载）
 }
 
+/**
+ * 播放队列：分段入队、顺序播放。MiMo 分段在入队时就开始合成，播放前一段时后一段已在准备，
+ * 因此回复可以边生成边朗读。队列播完或被 [stop] 打断时触发待完成回调。
+ */
 object TtsManager : TextToSpeech.OnInitListener {
     private const val TAG = "TtsManager"
+    private val ACK_PHRASES = listOf("我在", "在呢", "请说")
 
     private var appContext: Context? = null
     private var tts: TextToSpeech? = null
     private var mediaPlayer: MediaPlayer? = null
     private var currentSynthesisJob: Job? = null
-    private val scope = CoroutineScope(Dispatchers.Main)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     private val _isReady = MutableStateFlow(false)
     val isReady: StateFlow<Boolean> = _isReady.asStateFlow()
@@ -40,6 +52,20 @@ object TtsManager : TextToSpeech.OnInitListener {
     val isSpeaking: StateFlow<Boolean> = _isSpeaking.asStateFlow()
 
     private var currentOnDone: (() -> Unit)? = null
+
+    /** 正在播放的分段文字；打断检测据此忽略播报内容本身含有的打断词或唤醒词。 */
+    @Volatile var speakingText: String = ""
+        private set
+
+    /** [audio] 为空表示用系统 TTS 朗读；[keepFile] 的音频是唤醒应答缓存，播放后保留。 */
+    private class Segment(val text: String, val audio: Deferred<File?>?, val keepFile: Boolean = false)
+    private val queue = ArrayDeque<Segment>()
+    private var playing = false
+    /** 每次 [stop] 递增，使被打断的合成与播放回调失效。 */
+    private var generation = 0
+    private var ackJob: Job? = null
+    /** 云端合成的并行上限：足以让后续分段在前一段播放时就绪，又不至于触发限流。 */
+    private val mimoSlots = Semaphore(3)
 
     // Configuration
     var engineType: TtsEngineType = TtsEngineType.MIMO
@@ -65,6 +91,9 @@ object TtsManager : TextToSpeech.OnInitListener {
                         .build()
                 )
             }
+            // 上次进程遗留的分段音频不再使用。
+            File(context.applicationContext.cacheDir, "tts_segments").deleteRecursively()
+            LocalTts.refresh(context.applicationContext)
         }
     }
 
@@ -85,29 +114,17 @@ object TtsManager : TextToSpeech.OnInitListener {
                 }
 
                 override fun onDone(utteranceId: String?) {
-                    scope.launch {
-                        _isSpeaking.value = false
-                        currentOnDone?.invoke()
-                        currentOnDone = null
-                    }
+                    scope.launch { segmentFinished(utteranceGeneration(utteranceId)) }
                 }
 
                 @Deprecated("Deprecated in Java")
                 override fun onError(utteranceId: String?) {
-                    scope.launch {
-                        _isSpeaking.value = false
-                        currentOnDone?.invoke()
-                        currentOnDone = null
-                    }
+                    scope.launch { segmentFinished(utteranceGeneration(utteranceId)) }
                 }
 
                 override fun onError(utteranceId: String?, errorCode: Int) {
                     Log.e(TAG, "System TTS Utterance error: $errorCode")
-                    scope.launch {
-                        _isSpeaking.value = false
-                        currentOnDone?.invoke()
-                        currentOnDone = null
-                    }
+                    scope.launch { segmentFinished(utteranceGeneration(utteranceId)) }
                 }
             })
 
@@ -118,6 +135,8 @@ object TtsManager : TextToSpeech.OnInitListener {
             _isReady.value = false
         }
     }
+
+    private fun utteranceGeneration(utteranceId: String?): Int = utteranceId?.substringBefore(':')?.toIntOrNull() ?: -1
 
     fun setSpeechRate(rate: Float) {
         speechRate = rate
@@ -133,8 +152,10 @@ object TtsManager : TextToSpeech.OnInitListener {
         mimoApiKey = apiKey.trim()
         mimoVoice = voice.trim()
         mimoStylePrompt = stylePrompt.trim()
+        prepareAcks()
     }
 
+    /** 打断当前播放并朗读 [text]；播放结束或被打断时调用 [onDone]。 */
     @Synchronized
     fun speak(text: String, onDone: (() -> Unit)? = null) {
         val trimmed = text.trim()
@@ -145,102 +166,156 @@ object TtsManager : TextToSpeech.OnInitListener {
 
         stop()
         currentOnDone = onDone
+        queue.addLast(newSegment(trimmed))
+        playNext()
+    }
 
-        when (engineType) {
-            TtsEngineType.MIMO -> speakWithMimo(trimmed)
-            TtsEngineType.SYSTEM -> speakWithSystemTts(trimmed)
+    /** 追加一段到队列，不打断正在播放的内容；队列播完或被打断时调用 [onIdle]。 */
+    @Synchronized
+    fun enqueue(text: String, onIdle: (() -> Unit)? = null) {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return
+        if (onIdle != null) currentOnDone = onIdle
+        queue.addLast(newSegment(trimmed))
+        if (!playing) playNext()
+    }
+
+    /** 唤醒应答：优先播放已缓存的 MiMo 短语，没有缓存时用系统 TTS，保证立即出声。 */
+    @Synchronized
+    fun speakAck(onDone: () -> Unit) {
+        stop()
+        currentOnDone = onDone
+        val index = ACK_PHRASES.indices.random()
+        val cached = ackFile(index)?.takeIf { engineType == TtsEngineType.MIMO && it.length() > 0 }
+        // 没有缓存的云端应答时走常规分段（离线模型合成两个字只需几十毫秒）。
+        queue.addLast(if (cached != null) Segment(ACK_PHRASES[index], CompletableDeferred(cached), keepFile = true) else newSegment(ACK_PHRASES[index]))
+        playNext()
+    }
+
+    private fun newSegment(text: String): Segment {
+        val context = appContext ?: return Segment(text, null)
+        val directory = File(context.cacheDir, "tts_segments")
+        val rate = speechRate
+        fun local(): File? = File(directory, "${UUID.randomUUID()}.wav").takeIf { LocalTts.synthesize(context, text, rate, it) }
+        return when {
+            engineType == TtsEngineType.LOCAL -> Segment(text, scope.async(Dispatchers.Default) { local() })
+            engineType == TtsEngineType.MIMO && mimoApiKey.isNotBlank() -> {
+                val key = mimoApiKey
+                val voice = mimoVoice
+                val style = mimoStylePrompt
+                // 入队即开始合成，多段并行，轮到播放时通常已经就绪；云端失败时该段改用本地离线模型，再不行才交给系统 TTS。
+                Segment(text, scope.async(Dispatchers.IO) {
+                    val cloud = mimoSlots.withPermit {
+                        MimoTtsClient.synthesize(text = text, apiKey = key, voice = voice, stylePrompt = style, format = "mp3")
+                    }
+                    cloud.fold(
+                        onSuccess = { bytes ->
+                            directory.mkdirs()
+                            File(directory, "${UUID.randomUUID()}.mp3").also { it.writeBytes(bytes) }
+                        },
+                        onFailure = { error ->
+                            Log.e(TAG, "MiMo TTS failed, falling back to offline TTS: ${error.message}")
+                            local()
+                        }
+                    )
+                })
+            }
+            // 系统引擎；设备没有系统 TTS 时由播放阶段跳过。未配置 MiMo 密钥时优先用已安装的离线模型。
+            engineType == TtsEngineType.MIMO && LocalTts.installed.value -> Segment(text, scope.async(Dispatchers.Default) { local() })
+            else -> Segment(text, null)
         }
     }
 
-    private fun speakWithMimo(text: String) {
-        _isSpeaking.value = true
-        currentSynthesisJob = scope.launch {
-            val result = MimoTtsClient.synthesize(
-                text = text,
-                apiKey = mimoApiKey,
-                voice = mimoVoice,
-                stylePrompt = mimoStylePrompt,
-                format = "mp3"
-            )
-
-            result.fold(
-                onSuccess = { audioBytes ->
-                    playAudioBytes(audioBytes)
-                },
-                onFailure = { error ->
-                    Log.e(TAG, "MiMo TTS failed, falling back to System TTS: ${error.message}")
-                    speakWithSystemTts(text)
-                }
-            )
-        }
-    }
-
-    private fun playAudioBytes(audioBytes: ByteArray) {
-        val context = appContext
-        if (context == null) {
+    @Synchronized
+    private fun playNext() {
+        val current = generation
+        val segment = queue.removeFirstOrNull()
+        if (segment == null) {
+            playing = false
+            speakingText = ""
             _isSpeaking.value = false
-            currentOnDone?.invoke()
+            val callback = currentOnDone
             currentOnDone = null
+            callback?.invoke()
             return
         }
+        playing = true
+        speakingText = segment.text
+        _isSpeaking.value = true
+        val audio = segment.audio
+        if (audio == null) {
+            speakWithSystemTts(segment.text, current)
+            return
+        }
+        currentSynthesisJob = scope.launch {
+            val file = runCatching { audio.await() }.getOrNull()
+            if (current != generation) {
+                if (!segment.keepFile) file?.delete()
+                return@launch
+            }
+            if (file != null) playFile(file, segment.keepFile, segment.text, current) else speakWithSystemTts(segment.text, current)
+        }
+    }
 
+    private fun segmentFinished(segmentGeneration: Int) {
+        if (segmentGeneration != generation) return
+        playNext()
+    }
+
+    private fun playFile(file: File, keepFile: Boolean, fallbackText: String, current: Int) {
         try {
-            val cacheDir = context.cacheDir
-            val tempFile = File(cacheDir, "mimo_tts_${System.currentTimeMillis()}.mp3")
-            FileOutputStream(tempFile).use { it.write(audioBytes) }
-
             val player = mediaPlayer ?: MediaPlayer().also { mediaPlayer = it }
             player.reset()
-            player.setDataSource(tempFile.absolutePath)
+            player.setDataSource(file.absolutePath)
             player.prepare()
             player.setOnCompletionListener {
-                tempFile.delete()
-                _isSpeaking.value = false
-                currentOnDone?.invoke()
-                currentOnDone = null
+                if (!keepFile) file.delete()
+                segmentFinished(current)
             }
             player.setOnErrorListener { _, what, extra ->
                 Log.e(TAG, "MediaPlayer error: what=$what, extra=$extra")
-                tempFile.delete()
-                _isSpeaking.value = false
-                currentOnDone?.invoke()
-                currentOnDone = null
+                if (!keepFile) file.delete()
+                segmentFinished(current)
                 true
             }
             player.start()
         } catch (e: Exception) {
             Log.e(TAG, "Failed to play synthesized audio", e)
-            _isSpeaking.value = false
-            currentOnDone?.invoke()
-            currentOnDone = null
+            file.delete()
+            speakWithSystemTts(fallbackText, current)
         }
     }
 
-    private fun speakWithSystemTts(text: String) {
+    private fun speakWithSystemTts(text: String, current: Int) {
         val engine = tts
         if (engine == null || !_isReady.value) {
             Log.w(TAG, "System TTS not ready yet, skipping speak")
-            _isSpeaking.value = false
-            currentOnDone?.invoke()
-            currentOnDone = null
+            segmentFinished(current)
             return
         }
 
-        val utteranceId = UUID.randomUUID().toString()
-        val params = Bundle()
-        val result = engine.speak(text, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
+        val utteranceId = "$current:${UUID.randomUUID()}"
+        val result = engine.speak(text, TextToSpeech.QUEUE_FLUSH, Bundle(), utteranceId)
         if (result == TextToSpeech.ERROR) {
             Log.e(TAG, "Error invoking System TTS speak")
-            _isSpeaking.value = false
-            currentOnDone?.invoke()
-            currentOnDone = null
+            segmentFinished(current)
         }
     }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
     @Synchronized
     fun stop() {
+        generation++
         currentSynthesisJob?.cancel()
         currentSynthesisJob = null
+        queue.forEach { segment ->
+            val audio = segment.audio ?: return@forEach
+            if (segment.keepFile) return@forEach
+            if (audio.isCompleted && !audio.isCancelled) runCatching { audio.getCompleted()?.delete() } else audio.cancel()
+        }
+        queue.clear()
+        playing = false
+        speakingText = ""
 
         try {
             if (mediaPlayer?.isPlaying == true) {
@@ -256,6 +331,33 @@ object TtsManager : TextToSpeech.OnInitListener {
         val callback = currentOnDone
         currentOnDone = null
         callback?.invoke()
+    }
+
+    private fun ackFile(index: Int): File? {
+        val context = appContext ?: return null
+        val variant = (mimoVoice + "|" + mimoStylePrompt).hashCode().toUInt().toString(16)
+        return File(File(context.filesDir, "tts_ack"), "${variant}_$index.mp3")
+    }
+
+    /** 后台准备当前音色的唤醒应答音频；已存在的不重复合成，失败时下次配置或启动再试。 */
+    private fun prepareAcks() {
+        if (engineType != TtsEngineType.MIMO || mimoApiKey.isBlank() || appContext == null) return
+        val key = mimoApiKey
+        val voice = mimoVoice
+        val style = mimoStylePrompt
+        ackJob?.cancel()
+        ackJob = scope.launch(Dispatchers.IO) {
+            ACK_PHRASES.forEachIndexed { index, phrase ->
+                val target = ackFile(index) ?: return@launch
+                if (target.length() > 0) return@forEachIndexed
+                MimoTtsClient.synthesize(text = phrase, apiKey = key, voice = voice, stylePrompt = style, format = "mp3").onSuccess { bytes ->
+                    target.parentFile?.mkdirs()
+                    val partial = File(target.parentFile, target.name + ".partial")
+                    partial.writeBytes(bytes)
+                    if (!partial.renameTo(target)) partial.delete()
+                }
+            }
+        }
     }
 
     @Synchronized

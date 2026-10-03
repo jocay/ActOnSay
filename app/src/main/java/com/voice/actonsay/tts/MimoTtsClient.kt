@@ -17,7 +17,7 @@ object MimoTtsClient {
     const val DEFAULT_API_URL = "https://api.xiaomimimo.com/v1/chat/completions"
     const val DEFAULT_MODEL = "mimo-v2.5-tts"
     const val DEFAULT_VOICE = "mimo_default"
-    const val DEFAULT_KEY = "sk-c4h383z6kyl7wqfbm6u8mfb8gfy3o52lje8vndg3ae6zznha"
+    const val DEFAULT_KEY = ""
 
     val SUPPORTED_VOICES = listOf(
         "mimo_default" to "默认 (冰糖)",
@@ -51,7 +51,8 @@ object MimoTtsClient {
                 return@withContext Result.failure(IllegalArgumentException("合成文本不能为空"))
             }
 
-            val key = if (apiKey.isNotBlank()) apiKey.trim() else DEFAULT_KEY
+            val key = apiKey.trim()
+            require(key.isNotEmpty()) { "请先配置 MiMo TTS API Key，或使用系统 TTS" }
 
             val messagesArray = JSONArray().apply {
                 if (stylePrompt.isNotBlank()) {

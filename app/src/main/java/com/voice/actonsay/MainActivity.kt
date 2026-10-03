@@ -12,18 +12,41 @@ import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import com.voice.actonsay.asr.AsrManager
 import com.voice.actonsay.asr.AsrService
+import com.voice.actonsay.tasks.TaskRuntime
 import com.voice.actonsay.ui.ActOnSayApp
 import com.voice.actonsay.ui.theme.ActOnSayTheme
 
 class MainActivity : ComponentActivity() {
+    private var openTasksRequested by mutableIntStateOf(0)
+
+    // 任务前台服务与完成通知依赖通知权限；系统对话框结束后再请求电池优化豁免，避免两个系统界面叠加。
+    private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        requestBatteryOptimizationExemption()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.getBooleanExtra("open_tasks", false)) openTasksRequested++
+    }
+
+    override fun onStart() {
+        super.onStart()
+        TaskRuntime.startFromForeground()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (intent.getBooleanExtra("open_tasks", false)) openTasksRequested++
         AsrManager.init(this)
         enableEdgeToEdge()
 
@@ -36,7 +59,13 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        requestBatteryOptimizationExemption()
+        val needsNotificationPermission = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        if (needsNotificationPermission && savedInstanceState == null) {
+            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            requestBatteryOptimizationExemption()
+        }
 
         setContent {
             val state by AsrManager.state.collectAsState()
@@ -50,7 +79,7 @@ class MainActivity : ComponentActivity() {
             }
 
             ActOnSayTheme(themeMode = state.themeMode, dynamicColor = state.dynamicColor) {
-                ActOnSayApp()
+                ActOnSayApp(openTasksRequest = openTasksRequested)
             }
         }
     }

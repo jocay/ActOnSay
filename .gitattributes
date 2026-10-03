@@ -1,0 +1,5 @@
+# Debian 执行服务随 APK 打包后在容器内直接运行，必须保持 LF。
+debian/** text eol=lf
+*.sh text eol=lf
+gradlew text eol=lf
+*.bat text eol=crlf

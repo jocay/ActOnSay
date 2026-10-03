@@ -2,6 +2,40 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+遵循 `AGENTS.md`：只有用户明确要求才修改文件，不回滚已有改动。默认不运行构建、lint、类型检查、测试、安装、设备检查或持续日志监测，由用户执行。下方命令仅供用户参考。
+
+## Android 主控与 Debian 执行环境
+
+Android 保留语音与模型调用，`tasks/` 提供 Room 任务、会话、完整工具调用、恢复检查点和与调用绑定的授权记录。`AgentTaskService` 是独立于麦克风的 `specialUse` 前台服务；停止待机不取消任务。应用可见时 `MainActivity.onStart()` 请求启动服务，系统拒绝后台启动时保留等待应用状态。
+
+`AsrManager.set*()` 仍是界面配置入口，凭据经 `SettingsRepository` 使用 Keystore AES/GCM 加密。任务配置中的凭据快照也单独加密。旧明文只在加密保存成功后移除；旧聊天 JSON 在 Room 迁移成功后保留原文件。应用禁止系统备份，避免加密数据与设备密钥分离后被误当作可恢复凭据。
+
+以 AI 为核心：每条消息都是一个带全部工具的前台回合（`TaskRecord.source = "turn"`，`visible = false`），直接回答、调用工具还是用 `start_background_task` 转后台由模型决定，应用不按前缀或开关分类。只有后台任务（`visible = true`）显示任务卡片并出现在任务页；前台回合超出预算（6 次工具调用，或用过工具且超过 45 秒）时由 `TaskRuntime.promote` 原地转为后台任务继续执行。前台回合与后台任务各占一个槽。权限、预算和“结果不明不重放”仍由应用强制，不交给模型。模型可用的任务管理与只读工具在 `agent/tools/TaskTools.kt`（`start_background_task`、`list_tasks`、`get_task`、`cancel_task`、`remember`、`fetch_url`）；`fetch_url` 无需授权，但拒绝本机和局域网地址。关闭“允许调用工具”时退回纯聊天（`source = "chat"`）。
+
+上一轮未结束时来了新消息：`ai/FastDecisionClient`（TypeSafe Jev，`POST https://api.typesafe.ai/v1/systemone`，只做 choice/score/noul 判断，不生成文本）判断停止、打断、补充或排队；开关关闭、未配置密钥、超时或置信度不足时一律排队。已产生副作用的回合不会被“补充”打断重来。关键词绑定的模板作为提示附在消息后交给模型。任务页面提供明确的取消、恢复和重跑操作。屏幕保留完整回答，前台回合最多朗读 160 字摘要，后台任务和定时任务结果不自动朗读。
+
+`bridge/BridgeClient` 仅访问本机回环地址，使用随机配对令牌，关闭自动重定向和自动重试。`bridge/DeploymentManager` 在用户点击安装时通过 Droidspaces CLI 将 APK 中的 `debian/` 源码传入所选容器，执行独立安装脚本，并直接保存配对令牌。实测 `droidspaces run` 不转发标准输入、不传回退出码、单条命令上限约 8K 字符：安装包以 base64 按 6000 字符分块经参数写入，成败靠输出标记判断；`pair()` 只重新读取令牌。不会将失败的 Debian 请求回退到 Android Shell。[Droidspaces CLI 官方文档](https://github.com/ravindu644/Droidspaces-OSS/blob/main/Documentation/Linux-CLI.md)
+
+`debian/` 是 Python 执行服务，默认 `127.0.0.1:18765`，统一 `/v1` 接口；配置、调度、触发记录、执行日志和产物以 Debian SQLite 为准。系统目录为 `/opt/actonsay-bridge`（代码与虚拟环境）、`/var/lib/actonsay-bridge`（数据库、Skills、工作文件）、`/etc/actonsay-bridge/token`（受限配对凭据）。只管理自己的 `actonsay-bridge.service`，升级保留数据。
+
+工具返回 `ToolResult`，不从输出文案猜测执行是否成功。Android 和 Debian 权限分别控制，默认关闭自主执行；模型不能通过 `confirmed=true` 授权。等待确认记录绑定任务与工具调用，恢复先检查原执行记录。无法确认的 Android 操作保持结果待确认，必须显式处理。Shell 日志限量落盘，取消和超时处理整个进程组。报告请写到执行环境变量 `ACTONSAY_ARTIFACT_DIR` 指定的产物目录。
+
+MCP 支持 SDK 管理的 stdio 和 Streamable HTTP，工具使用服务命名空间；resources、prompts 和二进制产物通过桥接接口提供。Skills 导入不自动安装依赖，按需加载正文和引用，并将每个任务所用的 Skill 固定为快照。调度支持脚本与 AI 目标、一次性/间隔/Cron、时区、补跑与去重；Android 持久化领取 AI 触发后才确认，固定脚本独立于 Android 运行。
+
+`TtsManager` 是分段播放队列：`enqueue()` 追加不打断，MiMo 分段入队即开始合成；`speak()` 仍先 `stop()`，队列播完或被打断都会触发待完成回调（回调里只切协程，不要在播放器锁内获取 `AsrManager` 的锁）。前台回合的回复由 `AsrManager.feedSpeech` 边生成边切段入队：首段取第一个分句，之后每段约 30 字在标点处断开，MiMo 最多 3 路并行合成；默认朗读全文（`ttsFullReply`，关闭后限 160 字），表格和代码块不读。语音来的消息会在系统提示词后附加“口语化、简短”的提示。引擎有三种：MiMo、`LOCAL`（`tts/LocalTts.kt`，sherpa-onnx `matcha-icefall-zh-baker` + `vocos-22khz-univ`，约 131 MB，从 hf-mirror 按需下载到 `filesDir/tts_models`）、系统 TTS；MiMo 某段失败时该段改用本地模型。语音唤醒后先播应答（`speakAck`，MiMo 短语缓存在 `filesDir/tts_ack`，没有缓存时走常规分段），应答期间丢弃拾音并重置未说话计时；点击麦克风唤醒不应答。
+
+虚拟屏（`virtual_screen` 工具，`agent/VirtualScreen.kt`）：`vdisplay/DisplayHelper` 不属于应用进程，由 Root 以 `CLASSPATH=<apk> app_process` 单独启动，用隐藏标志创建可信虚拟显示器并通过 `ImageReader` 持有画面，和应用之间用标准输入输出传单行 JSON（截图以 base64 JPEG 返回）；它只能用框架类和反射，不能引用应用内单例。启动应用和注入输入走 `am start --display N`、`input -d N`。读不到副屏控件树（`uiautomator dump` 不支持指定显示器），所以每步返回截图交给视觉模型，需要开启“模型支持图像输入”；`AgentRunner` 在对话里只保留最新一张截图。实测这台设备（LineageOS，Android 16）上虚拟屏和主屏同属一个电源组，系统休眠时不渲染：休眠中操作时先 `KEYCODE_WAKEUP` 再 `cmd display power-off 0`（面板黑、系统醒），持有亮屏唤醒锁，空闲 90 秒后 `cmd display power-reset 0` 并睡回去；期间用户按电源键会触发 `ACTION_SCREEN_OFF`，立即恢复面板供电状态。`input text` 只能输入 ASCII。
+
+纯语音体验：播报时录音不再完全丢弃，`KwsManager` 另有一条打断词流（默认“等一下”，含“一”的词自动登记 yī/yí/yì 三种读法），播报时同时喂打断流和唤醒流，前台回合在执行或音乐在播放时待机状态也监听打断词；命中后 `onInterrupt` 停止播报并直接收音（不应答），任务继续执行。播报内容本身含有该词时忽略（`TtsManager.speakingText`），录音会话开启系统回声消除。语音回合的回答播完后进入连续对话（再听 5 秒）；语音回合 8 秒没出声时按工具上报的进度念一句；转后台时念一句；后台任务完成时通报，定时任务直接念结果并用高优先级“定时提醒”通知。提示词要求模型调用工具前先说一句短话，由流式朗读直接念出。
+
+系统应用工具在 `agent/tools/SystemAppTools.kt`：`set_timer`/`set_alarm`（系统时钟 `AlarmClock` 意图，提醒以此为准，不用自动化）、`add_calendar_event`/`list_calendar_events`（无云账户时自建本地日历 ActOnSay；设备没有日历应用，日程不会弹提醒）、`find_contact`、`call_phone`/`send_sms`（默认每次都要界面授权，`ToolContext.requireConfirmation`，不受自主模式开关影响）、`read_notifications`（`agent/NotificationReader` 只在内存保留最近 100 条）。后台启动这些 Activity 依赖“显示在其他应用上层”权限；清单里的 `<queries>` 是 Android 11 包可见性所必需。音乐：`media/MusicSource`（ChKSz 解析，网易云为主，QQ、酷狗备选，按歌手匹配排序，播放地址播放前再解析）和 `media/MusicPlayer`（MediaPlayer、媒体会话、通知栏控制，播报和收音时自动压低到 15%）。内置浏览器 `browser/AgentBrowser` 是一个常驻 WebView，按编号读取和操作页面元素，任务页“AI 浏览器”可查看。电源由 `agent/PowerKeeper` 统一管理：虚拟屏会话和常驻交互模式都靠“唤醒后关闭面板供电”，黑屏时按电源键会恢复面板并正常亮屏。虚拟屏输入中文时先写剪贴板再发送粘贴键。
+
+联网工具在 `agent/tools/WebTools.kt`：`web_search`（Brave、Exa，密钥在“设置 › 联网与搜索”，Keystore 加密）和 `fetch_url` 共用 `WebAccess`——只访问公网地址，先直连，失败且配置了 `webProxy`（`host:port`）时走代理，并按主机记住下次优先走代理。实测这台手机直连 Exa 可达、Brave 超时。助手回复用 `ui/components/MarkdownText.kt` 渲染常见 Markdown 子集，不引入第三方库。
+
+`RootShell.exec` 用 `setsid` 隔离进程组，优先 `setsid -w`：`su` 启动的 Shell 可能已是会话组长，不带 `-w` 时 `setsid` fork 后立即返回，命令会被当成已结束并清理。`debian/` 下的文件由 `.gitattributes` 固定为 LF（仓库启用了 `core.autocrlf`，CRLF 的 `install.sh` 无法在容器内运行）。明文 HTTP 只对 `res/xml/network_security_config.xml` 列出的地址开放（本机回环、`10.0.2.2`、`223.5.5.5`）；局域网 HTTP 模型地址需在此添加。内置 Skill 在服务启动时随版本刷新，用户导入的 Skill 只通过显式更新变化。
+
+已在真机（Android 16、KernelSU、Droidspaces Debian 13）验证：构建安装、Room v1→v2 迁移、容器服务安装与升级、健康检查与测试执行、前台回合经 `fetch_url` 回答天气。尚未验证：应用内部署向导、后台任务与自动转后台、Jev 重叠判断、MCP、定时任务和授权流程；不把代码已写入当作场景已通过。构建时 Gradle 不读 `http_proxy` 环境变量，jitpack 需要显式 `-Dhttps.proxyHost/-Dhttps.proxyPort`。
+
 ## Project Overview
 
 ActOnSay (`com.voice.actonsay`) is a single-module Android voice assistant (Kotlin, Jetpack Compose / Material 3) with a hybrid on-device + cloud pipeline. Every utterance flows through this chain:
@@ -22,7 +56,7 @@ UI text and code comments are Chinese; log messages are English. `strings.xml` h
 ## UI Layer (`ui/`)
 
 - `MainActivity` is thin: it calls `AsrManager.init`, optionally auto-starts `AsrService` (setting `autoStartOnLaunch`), applies `FLAG_KEEP_SCREEN_ON` while listening if `keepScreenOn` is set, and hosts `ActOnSayApp()` inside `ActOnSayTheme(themeMode, dynamicColor)`.
-- `ui/ActOnSayApp.kt` is state-driven navigation (no navigation-compose): three bottom tabs (`对话` `HomeScreen`, `动作` `ActionsScreen`, `设置` `SettingsHubScreen`) plus a `SettingsPage?` sub-page stack (AI / ASR / TTS / 唤醒词 / 外观与行为 / 关于与数据). `BackHandler` pops the sub-page, then returns to the home tab. The bottom bar is hidden while a sub-page is open.
+- `ui/ActOnSayApp.kt` is state-driven navigation (no navigation-compose): four bottom tabs (`对话` `HomeScreen`, `任务` `TasksScreen`, `自动化` `AutomationScreen`, `设置` `SettingsHubScreen`) plus a `SettingsPage?` sub-page stack (AI / ASR / TTS / 唤醒词 / 外观与行为 / 关于与数据). `BackHandler` pops the sub-page, then returns to the home tab. The bottom bar is hidden while a sub-page is open.
 - Settings screens write through to `AsrManager.set*()` on every change (no explicit save button). Text fields keep a local draft keyed on the state value with `remember(state.x)`.
 - `ui/theme/`: custom indigo/teal/amber light and dark schemes in `Color.kt` (`LightColors`/`DarkColors` objects), `ThemeMode` (SYSTEM/LIGHT/DARK) and optional Material You dynamic color in `Theme.kt`. `engineStateColor(EngineState)` is the single source for per-state accent colors; `LocalIsDarkTheme` exposes the resolved mode to custom drawing.
 - `ui/icons/AppIcons.kt`: only `material-icons-core` is a dependency; every other glyph (mic, volume, bolt, palette, robot, …) is an inline `materialIcon { materialPath { … } }` vector. Add new icons there instead of pulling in `material-icons-extended`.
@@ -77,9 +111,9 @@ adb logcat -s AsrService AsrManager KwsManager PinyinHelper VolcengineAsrClient 
 
 ### Configuration and persistence
 
-- All settings live in SharedPreferences `actonsay_prefs` and are mirrored into `AsrState`; the `AsrManager.set*()` methods are the only writers (granular: `setAiEnabled`, `setAiEndpoint`, `setAiSystemPrompt`, `setAiBehavior(streaming, contextTurns)`, `setTtsEnabled`, `setTtsEngine`, `setMimoConfig`, `setSystemTtsParams`, `setAppearance`, `setBehavior`, …). `resetAllSettings()` clears prefs but keeps chat history.
+- Non-secret settings live in SharedPreferences `actonsay_prefs`; credentials are encrypted with Android Keystore by `config/SettingsRepository.kt`, and settings are mirrored into `AsrState`; the `AsrManager.set*()` methods are the only writers (granular: `setAiEnabled`, `setAiEndpoint`, `setAiSystemPrompt`, `setAiBehavior(streaming, contextTurns)`, `setTtsEnabled`, `setTtsEngine`, `setMimoConfig`, `setSystemTtsParams`, `setAppearance`, `setBehavior`, …). `resetAllSettings()` clears prefs but keeps chat history.
 - First-run defaults: wake words `你好小智` and `小爱同学`; AI at DeepSeek `deepseek-chat`, streaming on, 6 context turns; TTS engine MiMo; Volcengine resource ID BigASR 1.0; theme follows system, dynamic color off.
-- Chat history is persisted to `filesDir/chat_history.json` (debounced 400 ms, capped at `MAX_MESSAGES` = 300, loading messages skipped) and keyword hit events to `filesDir/keyword_events.json` (capped at 200). Action keywords are in prefs (`action_keywords`) via `addActionKeyword`/`removeActionKeyword`. Usage counters (`totalWakeCount`, `totalTurnCount`) are in prefs too.
+- Chat history is persisted in Room through `TaskRepository` (debounced 400 ms, capped at `MAX_MESSAGES` = 300). The old `filesDir/chat_history.json` is migrated once and retained. Keyword hit events remain in `filesDir/keyword_events.json` (capped at 200). Action keywords are in prefs (`action_keywords`) via `addActionKeyword`/`removeActionKeyword`. Usage counters (`totalWakeCount`, `totalTurnCount`) are in prefs too.
 
 ### Wake words (`asr/KwsManager.kt`, `asr/PinyinHelper.kt`)
 
@@ -100,7 +134,7 @@ adb logcat -s AsrService AsrManager KwsManager PinyinHelper VolcengineAsrClient 
 
 ### TTS (`tts/TtsManager.kt`, `tts/MimoTtsClient.kt`)
 
-- `TtsEngineType.MIMO`: Xiaomi MiMo `mimo-v2.5-tts` through a chat-completions-shaped request (`messages` = optional style prompt as `user` + the text to speak as `assistant`, plus `audio: {format, voice}`). The response carries base64 MP3 in `choices[0].message.audio.data`, which is written to a cache temp file and played with `MediaPlayer`. Any MiMo failure falls back to the system engine for that utterance. `MimoTtsClient.DEFAULT_KEY` is a hard-coded key used whenever the user leaves the MiMo key blank.
+- `TtsEngineType.MIMO`: Xiaomi MiMo `mimo-v2.5-tts` through a chat-completions-shaped request (`messages` = optional style prompt as `user` + the text to speak as `assistant`, plus `audio: {format, voice}`). The response carries base64 MP3 in `choices[0].message.audio.data`, which is written to a cache temp file and played with `MediaPlayer`. Any MiMo failure falls back to the system engine for that utterance. MiMo requires a user-configured key; the embedded default credential has been removed.
 - `TtsEngineType.SYSTEM`: Android `TextToSpeech` with `Locale.CHINESE`. Speech rate and pitch apply only to this engine, and the settings UI shows those sliders only for it.
 - `speak(text, onDone)` always calls `stop()` first, and `stop()` fires the pending `onDone` callback. `AsrManager` relies on that callback to leave `SPEAKING_TTS`, so keep that contract if you touch `TtsManager`.
 

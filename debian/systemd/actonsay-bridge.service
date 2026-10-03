@@ -1,0 +1,24 @@
+[Unit]
+Description=ActOnSay local Debian execution bridge
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/actonsay-bridge/current
+EnvironmentFile=/etc/actonsay-bridge/environment
+ExecStart=/opt/actonsay-bridge/current/venv/bin/python -m actonsay_bridge
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+KillMode=control-group
+UMask=0077
+LimitNOFILE=4096
+TasksMax=256
+MemoryMax=768M
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

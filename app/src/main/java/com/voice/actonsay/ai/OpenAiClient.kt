@@ -5,6 +5,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.launch
+import com.voice.actonsay.tasks.CredentialRedactor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -73,6 +77,9 @@ object OpenAiClient {
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(120, TimeUnit.SECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(false)
+        .followRedirects(false)
+        .followSslRedirects(false)
         .build()
 
     fun normalizeUrl(baseUrl: String): String {
@@ -149,8 +156,8 @@ object OpenAiClient {
         while (true) {
             attempt++
             var streamedAnything = false
-            val wrappedDelta: ((String) -> Unit)? = onDelta?.let { cb -> { text -> streamedAnything = true; cb(text) } }
-            val result = completeOnce(baseUrl, apiKey, model, messages, tools, stream, wrappedDelta)
+            val wrappedDelta: (String) -> Unit = { text -> streamedAnything = true; onDelta?.invoke(text) }
+            val result = completeOnce(baseUrl, apiKey, model, messages, tools, stream, wrappedDelta) { streamedAnything = true }
             val error = result.exceptionOrNull()
             // 连接被代理/服务端掐断且还没收到任何内容：重试一次（请求本身幂等）
             if (error is java.io.IOException && !streamedAnything && attempt < MAX_ATTEMPTS && isActive) {
@@ -173,7 +180,8 @@ object OpenAiClient {
         messages: JSONArray,
         tools: JSONArray?,
         stream: Boolean,
-        onDelta: ((String) -> Unit)?
+        onDelta: ((String) -> Unit)?,
+        onStreamStarted: () -> Unit
     ): Result<ChatResponse> = withContext(Dispatchers.IO) {
         try {
             if (baseUrl.isBlank()) {
@@ -209,16 +217,21 @@ object OpenAiClient {
                 requestBuilder.header("Accept", "text/event-stream")
             }
 
-            client.newCall(requestBuilder.build()).execute().use { response ->
+            val call = client.newCall(requestBuilder.build())
+            // 同步读取响应时也取消底层 Socket，避免 Job 取消后仍等到 readTimeout。
+            val cancelWatcher = launch(start = CoroutineStart.UNDISPATCHED) {
+                try { awaitCancellation() } finally { call.cancel() }
+            }
+            try { call.execute().use { response ->
                 if (!response.isSuccessful) {
-                    val responseBody = response.body?.string() ?: ""
+                    val responseBody = response.body?.let { readLimitedBody(it) } ?: ""
                     val errMsg = try {
                         val errObj = JSONObject(responseBody).optJSONObject("error")
                         errObj?.optString("message") ?: responseBody
                     } catch (_: Exception) {
                         responseBody
                     }
-                    val msg = "API 请求失败 [HTTP ${response.code}]: $errMsg"
+                    val msg = CredentialRedactor.text("API 请求失败 [HTTP ${response.code}]: $errMsg")
                     Log.e(TAG, msg)
                     return@withContext Result.failure(Exception(msg))
                 }
@@ -227,43 +240,60 @@ object OpenAiClient {
                 val contentType = body.contentType()?.toString() ?: ""
 
                 if (stream && contentType.contains("text/event-stream")) {
-                    return@withContext Result.success(parseStream(body.source(), onDelta))
+                    return@withContext Result.success(parseStream(body.source(), onDelta, onStreamStarted))
                 }
 
                 // 非流式（或服务端忽略了 stream 参数）
-                val json = JSONObject(body.string())
+                val json = JSONObject(readLimitedBody(body))
                 val choices = json.optJSONArray("choices")
                 if (choices == null || choices.length() == 0) {
                     return@withContext Result.failure(Exception("API 返回结果为空 (无 choices)"))
                 }
-                val message = choices.getJSONObject(0).optJSONObject("message")
+                val choice = choices.getJSONObject(0)
+                if (choice.optString("finish_reason") !in listOf("stop", "tool_calls")) {
+                    return@withContext Result.failure(Exception("模型响应未完整结束：${choice.optString("finish_reason")}"))
+                }
+                val message = choice.optJSONObject("message")
                     ?: return@withContext Result.failure(Exception("API 返回结果缺少 message"))
-                val content = message.optString("content").trim()
+                val content = if (message.isNull("content")) "" else message.optString("content").trim()
+                if (content.length > MAX_CONTENT_CHARS) throw IllegalStateException("模型回复超过容量预算，未标记为完成")
                 val toolCalls = parseToolCalls(message.optJSONArray("tool_calls"))
                 if (content.isNotEmpty()) onDelta?.invoke(content)
                 Result.success(ChatResponse(content, toolCalls))
-            }
+            } } finally { cancelWatcher.cancel() }
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
             if (!isActive) throw kotlinx.coroutines.CancellationException("request cancelled", e)
-            Log.e(TAG, "Chat completion error", e)
+            Log.e(TAG, "Chat completion error: ${e.javaClass.simpleName}")
             Result.failure(e)
         }
     }
 
+    private const val MAX_CONTENT_CHARS = 64_000
+    private fun readLimitedBody(body: okhttp3.ResponseBody): String {
+        val source = body.source()
+        source.request(2L * 1024 * 1024 + 1)
+        check(source.buffer.size <= 2L * 1024 * 1024) { "模型响应超过容量预算，未标记为完成" }
+        return source.readUtf8()
+    }
+
     private fun parseToolCalls(arr: JSONArray?): List<ToolCall> {
         if (arr == null) return emptyList()
+        require(arr.length() <= 32) { "模型一次返回过多工具调用，未执行" }
         val list = ArrayList<ToolCall>(arr.length())
         for (i in 0 until arr.length()) {
-            val o = arr.optJSONObject(i) ?: continue
-            val fn = o.optJSONObject("function") ?: continue
+            val o = arr.optJSONObject(i) ?: throw IllegalStateException("模型工具调用格式不完整")
+            val fn = o.optJSONObject("function") ?: throw IllegalStateException("模型工具调用缺少function")
             val name = fn.optString("name")
-            if (name.isBlank()) continue
+            require(name.isNotBlank() && o.optString("id").isNotBlank()) { "模型工具调用缺少名称或ID" }
+            val arguments = fn.optString("arguments").ifBlank { "{}" }
+            require(arguments.length <= 256_000) { "模型工具参数超过容量限制" }
+            JSONObject(arguments)
             list += ToolCall(
-                id = o.optString("id").ifBlank { "call_$i" },
+                id = o.getString("id"),
                 name = name,
-                arguments = fn.optString("arguments").ifBlank { "{}" }
+                arguments = arguments
             )
         }
         return list
@@ -271,41 +301,58 @@ object OpenAiClient {
 
     private class PartialToolCall(var id: String = "", val name: StringBuilder = StringBuilder(), val args: StringBuilder = StringBuilder())
 
-    private fun kotlinx.coroutines.CoroutineScope.parseStream(source: okio.BufferedSource, onDelta: ((String) -> Unit)?): ChatResponse {
+    private fun kotlinx.coroutines.CoroutineScope.parseStream(source: okio.BufferedSource, onDelta: ((String) -> Unit)?, onStreamStarted: () -> Unit): ChatResponse {
         val sb = StringBuilder()
         val partialCalls = sortedMapOf<Int, PartialToolCall>()
+        var finishReason = ""
+        var done = false
         while (true) {
             ensureActive()
             val line = source.readUtf8Line() ?: break
             if (!line.startsWith("data:")) continue
             val data = line.removePrefix("data:").trim()
             if (data.isEmpty()) continue
-            if (data == "[DONE]") break
+            if (data == "[DONE]") { done = true; break }
             val chunk = try {
                 JSONObject(data)
             } catch (_: Exception) {
-                continue
+                throw java.io.IOException("模型流包含无效 JSON，回复未完成")
             }
             val choices = chunk.optJSONArray("choices") ?: continue
             if (choices.length() == 0) continue
-            val delta = choices.getJSONObject(0).optJSONObject("delta") ?: continue
-            val piece = delta.optString("content", "")
+            val choice = choices.getJSONObject(0)
+            if (!choice.isNull("finish_reason")) finishReason = choice.optString("finish_reason")
+            val delta = choice.optJSONObject("delta") ?: continue
+            val piece = if (delta.isNull("content")) "" else delta.optString("content", "")
             if (piece.isNotEmpty()) {
+                onStreamStarted()
                 sb.append(piece)
+                if (sb.length > MAX_CONTENT_CHARS) throw IllegalStateException("模型回复超过容量预算，未标记为完成")
                 onDelta?.invoke(sb.toString())
             }
             val calls = delta.optJSONArray("tool_calls") ?: continue
+            if (calls.length() > 0) onStreamStarted()
             for (i in 0 until calls.length()) {
                 val c = calls.optJSONObject(i) ?: continue
                 val index = c.optInt("index", i)
                 val partial = partialCalls.getOrPut(index) { PartialToolCall() }
+                if (partialCalls.size > 32) throw IllegalStateException("模型一次返回过多工具调用，未执行")
                 c.optString("id").takeIf { it.isNotBlank() }?.let { partial.id = it }
                 val fn = c.optJSONObject("function") ?: continue
                 fn.optString("name").takeIf { it.isNotBlank() }?.let { partial.name.append(it) }
+                if (partial.name.length > 128) throw IllegalStateException("模型工具名称超过容量限制")
                 fn.optString("arguments").takeIf { it.isNotEmpty() }?.let { partial.args.append(it) }
+                if (partial.args.length > 256_000) throw java.io.IOException("工具参数超过容量限制")
             }
         }
+        if (finishReason !in listOf("stop", "tool_calls") || (!done && finishReason.isBlank())) {
+            throw java.io.IOException("模型流未完整结束：${finishReason.ifBlank { "连接提前关闭" }}")
+        }
         val toolCalls = partialCalls.map { (index, p) ->
+            if (p.id.isBlank() || p.name.isBlank()) throw java.io.IOException("工具调用未完整返回")
+            try { JSONObject(p.args.toString().ifBlank { "{}" }) } catch (_: Exception) {
+                throw java.io.IOException("工具调用参数未完整返回")
+            }
             ToolCall(
                 id = p.id.ifBlank { "call_$index" },
                 name = p.name.toString(),

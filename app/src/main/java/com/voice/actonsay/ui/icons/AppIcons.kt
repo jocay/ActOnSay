@@ -9,6 +9,52 @@ import androidx.compose.ui.graphics.vector.ImageVector
  * 避免引入体积很大的 material-icons-extended。
  */
 object AppIcons {
+    val Task: ImageVector by lazy {
+        materialIcon(name = "Task") { materialPath {
+            moveTo(5f, 2f); horizontalLineTo(19f); verticalLineTo(22f); horizontalLineTo(5f); close()
+            moveTo(7f, 4f); verticalLineTo(20f); horizontalLineTo(17f); verticalLineTo(4f); close()
+            moveTo(9f, 8f); horizontalLineTo(15f); verticalLineTo(10f); horizontalLineTo(9f); close()
+            moveTo(9f, 13f); horizontalLineTo(15f); verticalLineTo(15f); horizontalLineTo(9f); close()
+        } }
+    }
+
+    val Schedule: ImageVector by lazy {
+        materialIcon(name = "Schedule") { materialPath {
+            moveTo(12f, 2f); curveTo(6.48f, 2f, 2f, 6.48f, 2f, 12f); reflectiveCurveToRelative(4.48f, 10f, 10f, 10f)
+            reflectiveCurveToRelative(10f, -4.48f, 10f, -10f); reflectiveCurveTo(17.52f, 2f, 12f, 2f); close()
+            moveTo(12f, 4f); curveTo(16.42f, 4f, 20f, 7.58f, 20f, 12f); reflectiveCurveToRelative(-3.58f, 8f, -8f, 8f)
+            reflectiveCurveToRelative(-8f, -3.58f, -8f, -8f); reflectiveCurveToRelative(3.58f, -8f, 8f, -8f); close()
+            moveTo(11f, 6f); horizontalLineTo(13f); verticalLineTo(11.5f); lineTo(17f, 14f); lineTo(16f, 15.5f); lineTo(11f, 12.5f); close()
+        } }
+    }
+
+    val Terminal: ImageVector by lazy {
+        materialIcon(name = "Terminal") { materialPath {
+            moveTo(2f, 4f); horizontalLineTo(22f); verticalLineTo(20f); horizontalLineTo(2f); close()
+            moveTo(4f, 6f); verticalLineTo(18f); horizontalLineTo(20f); verticalLineTo(6f); close()
+            moveTo(6f, 8f); lineTo(10f, 12f); lineTo(6f, 16f); lineTo(5f, 15f); lineTo(8f, 12f); lineTo(5f, 9f); close()
+            moveTo(12f, 14f); horizontalLineTo(18f); verticalLineTo(16f); horizontalLineTo(12f); close()
+        } }
+    }
+
+    val Extension: ImageVector by lazy {
+        materialIcon(name = "Extension") { materialPath {
+            moveTo(4f, 4f); horizontalLineTo(9f); verticalLineTo(2f); horizontalLineTo(15f); verticalLineTo(4f)
+            horizontalLineTo(20f); verticalLineTo(9f); horizontalLineTo(22f); verticalLineTo(15f); horizontalLineTo(20f)
+            verticalLineTo(20f); horizontalLineTo(4f); close()
+            moveTo(6f, 6f); verticalLineTo(18f); horizontalLineTo(18f); verticalLineTo(6f); close()
+        } }
+    }
+
+    val Skill: ImageVector by lazy {
+        materialIcon(name = "Skill") { materialPath {
+            moveTo(3f, 3f); horizontalLineTo(11f); lineTo(12f, 4f); lineTo(13f, 3f); horizontalLineTo(21f)
+            verticalLineTo(19f); horizontalLineTo(13f); lineTo(12f, 21f); lineTo(11f, 19f); horizontalLineTo(3f); close()
+            moveTo(5f, 5f); verticalLineTo(17f); horizontalLineTo(10f); verticalLineTo(5f); close()
+            moveTo(14f, 5f); verticalLineTo(17f); horizontalLineTo(19f); verticalLineTo(5f); close()
+        } }
+    }
+
     val Mic: ImageVector by lazy {
         materialIcon(name = "Mic") {
             materialPath {

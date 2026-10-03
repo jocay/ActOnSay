@@ -1,6 +1,15 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
+    id("com.google.devtools.ksp")
+}
+
+val packageDebianService by tasks.registering(Sync::class) {
+    from(rootProject.file("debian")) {
+        include("install.sh", "requirements.txt", "pyproject.toml", "actonsay_bridge/**", "skills/**", "systemd/**")
+        exclude("**/__pycache__/**", "**/*.pyc", "**/.git/**", "**/.venv/**")
+    }
+    into(layout.buildDirectory.dir("generated/debianAssets"))
 }
 
 android {
@@ -39,6 +48,8 @@ android {
     buildFeatures {
         compose = true
     }
+    // AGP 9 不接受 Provider；目录由 preBuild 依赖的 packageDebianService 生成。
+    sourceSets.getByName("main").assets.srcDir(layout.buildDirectory.dir("generated/debianAssets").get().asFile)
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
@@ -53,6 +64,14 @@ kotlin {
     compilerOptions {
         jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
     }
+}
+
+ksp {
+    arg("room.schemaLocation", "$projectDir/schemas")
+}
+
+tasks.named("preBuild").configure {
+    dependsOn(packageDebianService)
 }
 
 dependencies {
@@ -72,6 +91,9 @@ dependencies {
 
     implementation("com.github.k2-fsa.sherpa-onnx:sherpa-onnx:v1.13.6")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("androidx.room:room-runtime:2.8.5")
+    implementation("androidx.room:room-ktx:2.8.5")
+    ksp("androidx.room:room-compiler:2.8.5")
 
     testImplementation("junit:junit:4.13.2")
 

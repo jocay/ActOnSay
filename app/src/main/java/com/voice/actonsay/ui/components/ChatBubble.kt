@@ -34,6 +34,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -48,6 +49,9 @@ import androidx.compose.ui.unit.dp
 import com.voice.actonsay.asr.AsrManager
 import com.voice.actonsay.asr.ChatMessage
 import com.voice.actonsay.ui.icons.AppIcons
+import com.voice.actonsay.tasks.TaskRuntime
+import com.voice.actonsay.ui.screens.TaskCard
+import androidx.compose.material3.TextButton
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -60,7 +64,8 @@ fun ChatBubble(
     onCopyText: () -> Unit,
     onShare: () -> Unit,
     onDelete: () -> Unit,
-    onRetry: (() -> Unit)? = null
+    onRetry: (() -> Unit)? = null,
+    onOpenTasks: () -> Unit = {}
 ) {
     val isUser = message.role == "user"
     val dateFormat = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
@@ -139,11 +144,16 @@ fun ChatBubble(
                     if (message.isLoading && message.content.isBlank()) {
                         TypingDots(color = scheme.onSurfaceVariant)
                     } else {
-                        Text(
-                            text = message.content,
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = textColor
-                        )
+                        // 助手回复按 Markdown 渲染；用户消息和错误提示保持原文。
+                        if (isUser || message.isError) {
+                            Text(
+                                text = message.content,
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = textColor
+                            )
+                        } else {
+                            MarkdownText(text = message.content, color = textColor)
+                        }
                         if (message.isLoading) {
                             Spacer(Modifier.height(4.dp))
                             TypingDots(color = scheme.onSurfaceVariant, small = true)
@@ -220,6 +230,42 @@ fun ChatBubble(
                     leadingIcon = { Icon(Icons.Default.Delete, null, tint = scheme.error) },
                     onClick = { menuOpen = false; onDelete() }
                 )
+            }
+        }
+
+        if (!isUser && message.taskId.isNotBlank()) {
+            val tasks by TaskRuntime.tasks.collectAsState()
+            tasks.firstOrNull { it.id == message.taskId }?.let { task ->
+                val needsAttention = task.state in setOf("WAITING_CONFIRMATION", "RESULT_UNKNOWN", "WAITING_APP")
+                if (task.visible || needsAttention) {
+                    // 后台任务，或需要用户授权、核实的回合：直接展示任务卡片。
+                    Spacer(Modifier.height(6.dp))
+                    TaskCard(task, compact = true)
+                    if (task.visible) TextButton(onClick = onOpenTasks) { Text("打开任务页") }
+                } else {
+                    // 普通回合只在用过工具时提供可展开的执行过程。
+                    val callsFlow = remember(task.id) { TaskRuntime.toolCalls(task.id) }
+                    val calls by callsFlow.collectAsState(initial = emptyList())
+                    if (calls.isNotEmpty()) {
+                        var open by remember(task.id) { mutableStateOf(false) }
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(start = 6.dp, top = 4.dp).clickable { open = !open }
+                        ) {
+                            Icon(AppIcons.Bolt, null, tint = scheme.primary, modifier = Modifier.size(14.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text(
+                                "执行了 ${calls.size} 步" + if (open) " ▾" else " ▸",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = scheme.primary
+                            )
+                        }
+                        if (open) {
+                            Spacer(Modifier.height(6.dp))
+                            TaskCard(task, compact = true)
+                        }
+                    }
+                }
             }
         }
 

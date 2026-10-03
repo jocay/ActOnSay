@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <!-- 明文仅限本机执行服务、模拟器宿主机的 Ollama 预设和 AliDNS HTTP DNS 兜底。 -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain>127.0.0.1</domain>
+        <domain>localhost</domain>
+        <domain>::1</domain>
+        <domain>10.0.2.2</domain>
+        <domain>223.5.5.5</domain>
+    </domain-config>
+</network-security-config>

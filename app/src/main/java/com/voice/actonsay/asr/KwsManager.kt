@@ -18,6 +18,9 @@ class KwsManager {
     private var spotter: KeywordSpotter? = null
     private var stream: OnlineStream? = null
     private var currentWakeWords: Set<String> = emptySet()
+    /** 打断词单独一个流：播报、执行任务或播放音乐时与唤醒流并行监听。 */
+    private var interruptStream: OnlineStream? = null
+    private var currentInterruptWords: Set<String> = emptySet()
 
     @Synchronized
     fun init(assetManager: AssetManager) {
@@ -49,6 +52,7 @@ class KwsManager {
 
             spotter = KeywordSpotter(assetManager = assetManager, config = config)
             recreateStream()
+            updateInterruptWords(currentInterruptWords)
             Log.i(TAG, "Sherpa-onnx KWS engine initialized successfully")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to initialize KWS engine", e)
@@ -74,6 +78,43 @@ class KwsManager {
             Log.i(TAG, "Creating KWS stream with default keywords.txt")
             s.createStream()
         }
+    }
+
+    @Synchronized
+    fun updateInterruptWords(words: Set<String>) {
+        currentInterruptWords = words
+        val s = spotter ?: return
+        interruptStream?.release()
+        // “一”在口语里常变调（等一下读 yí），模型音素带声调，三种读法都登记。
+        val formatted = PinyinHelper.formatWakeWordsForStream(words).split(" / ").filter { it.isNotBlank() }.flatMap { line ->
+            if (" y ī " in " $line ") listOf(line, line.replace("y ī", "y í"), line.replace("y ī", "y ì")) else listOf(line)
+        }.joinToString(" / ")
+        // 没有可识别的打断词时不建流，避免回退到默认唤醒词文件。
+        interruptStream = if (formatted.isNotEmpty()) s.createStream(formatted) else null
+        Log.i(TAG, "Interrupt stream: ${formatted.ifEmpty { "disabled" }}")
+    }
+
+    @Synchronized
+    fun acceptInterruptSamples(samples: FloatArray, sampleRate: Int = SAMPLE_RATE): String? {
+        val s = interruptStream ?: return null
+        val spot = spotter ?: return null
+        s.acceptWaveform(samples, sampleRate)
+        while (spot.isReady(s)) {
+            spot.decode(s)
+            val kw = spot.getResult(s).keyword.trim()
+            if (kw.isNotEmpty()) {
+                spot.reset(s)
+                Log.i(TAG, "Interrupt word detected: '$kw'")
+                return kw
+            }
+        }
+        return null
+    }
+
+    @Synchronized
+    fun resetInterrupt() {
+        val s = interruptStream ?: return
+        spotter?.reset(s)
     }
 
     @Synchronized
@@ -105,6 +146,8 @@ class KwsManager {
     fun release() {
         stream?.release()
         stream = null
+        interruptStream?.release()
+        interruptStream = null
         spotter?.release()
         spotter = null
         Log.i(TAG, "KWS engine released")
