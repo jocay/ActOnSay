@@ -4,6 +4,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 遵循 `AGENTS.md`：只有用户明确要求才修改文件，不回滚已有改动。默认不运行构建、lint、类型检查、测试、安装、设备检查或持续日志监测，由用户执行。下方命令仅供用户参考。
 
+## 运行与存储约定
+
+- ASR 连接以会话代号隔离旧网络回调；`AsrManager` 在主线程消费识别回调时也核对会话。`asr/SpeechCoordinator.kt` 负责流式分段、进度播报、后台通报和连续对话。
+- 前台任务转为后台展示后，若后台槽仍占用，继续占用原槽直到后台槽空出；取消中的任务清理完成前也不释放槽位，总运行数最多两个。
+- 流式回复约每 200 毫秒更新内存，中途文本约每两秒持久化，最终结果和工具检查点仍立即保存。聊天按消息差异增量写入。任务列表按需增加历史加载量，并始终保留未结束任务和当前聊天引用。
+- 设置凭据由 `AsrManager.set*()` 即时更新，`SettingsRepository` 在 IO 线程合并保存、跳过未变化的值，并上报保存失败。部署配对通过 `setPairedBridgeConfig()` 等待凭据落盘后继续。MiMo 应答缓存等待配置输入稳定后准备。
+- 关于与数据页提供用户确认后的历史清理，保留最近 7/30/90 天；不自动删除，不清理未结束、结果待确认、聊天引用、未同步的自动化结果或 Debian 同步记录。只清理本机任务目录及无引用的旧加密载荷，不跟随符号链接。
+- 浏览器页面读取不回传输入框的值，正文跳过可编辑区域。TTS 停止同时取消当前段、排队合成及底层网络请求，本地合成返回后清理已取消段的音频。
+- 前台回合在 `TaskRuntime.runTask` 开始时用 `currentHistory()` 按 Room 聊天记录重建上下文，排队期间结束的前几轮用任务最终结果补齐；找不到聊天记录时沿用提交快照。
+- 取消涉及 Debian/MCP 执行时任务先进入 `CANCELLING`，执行端确认停止后才改为 `CANCELLED`；未送达时由 `syncBridge` 周期重试。`TaskStates.cancelRequested()` 统一判断，结果不再覆盖。
+- Debian 执行创建进程前先持久化 `starting`，恢复时清理残留进程组并标记 `result_unknown`；`POST /v1/schedules/preview` 按正式规则预览触发时间。
+- 浏览器与虚拟屏按任务独占（`agent/ResourceLease.kt`，任务停止运行即释放）；浏览器点击/输入前校验页面版本，过期需先 `read`。MCP 工具在每个任务开始时固定为快照（`ExtensionCatalog`），不进入全局注册表。
+- 等待授权时保留朗读进度，授权后接着念；历史回复重播走 `SpeechCoordinator.replay()`，与正常播报同样进入 `SPEAKING_TTS`。整句为“别说了”等只停止朗读，“停止/取消任务”等停止当前会话的执行和排队回合（`AsrManager.localCommand`）。
+- 多会话复用 `conversations` 表，当前会话存 prefs `current_conversation`；后台任务气泡回到发起它的会话。工具缺少系统权限时返回 `SYSTEM_PERMISSION_MISSING` 并登记到 `SystemPermissions.pending`，`MainActivity` 在前台时申请；“设置 › 手机权限”集中管理。
+- 唤醒词与 VAD 模型在后台加载（`AsrState.voiceReady`），未就绪时录音帧直接丢弃。诊断（`diagnostics/Diagnostics.kt`）默认关闭，只保存在内存。任务通知按运行状态与进度去重、至多每秒更新，唤醒锁定期续期。
+- 上述变更尚未进行构建、测试或真机验证。
+
 ## Android 主控与 Debian 执行环境
 
 Android 保留语音与模型调用，`tasks/` 提供 Room 任务、会话、完整工具调用、恢复检查点和与调用绑定的授权记录。`AgentTaskService` 是独立于麦克风的 `specialUse` 前台服务；停止待机不取消任务。应用可见时 `MainActivity.onStart()` 请求启动服务，系统拒绝后台启动时保留等待应用状态。

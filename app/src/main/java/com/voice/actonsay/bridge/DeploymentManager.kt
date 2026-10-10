@@ -87,10 +87,7 @@ object DeploymentManager {
         // Shell 输出会对已知凭据脱敏：读到的令牌与已保存的相同时拿到的是脱敏标记，沿用已保存的值。
         val token = result.stdout.trim().let { if (it == "[已脱敏]") AsrManager.state.value.bridgeToken else it }
         require(token.matches(Regex("[A-Za-z0-9_-]{32,256}"))) { "没有读到有效的配对令牌，请先安装执行服务" }
-        withContext(Dispatchers.Main) {
-            AsrManager.setBridgeContainer(container)
-            AsrManager.setBridgeConfig("http://127.0.0.1:18765", token)
-        }
+        AsrManager.setPairedBridgeConfig(container, "http://127.0.0.1:18765", token)
         withTimeout(45_000) {
             var lastError: Exception? = null
             for (attempt in 1..15) {

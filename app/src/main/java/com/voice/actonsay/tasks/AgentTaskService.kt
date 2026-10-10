@@ -15,7 +15,9 @@ import com.voice.actonsay.bridge.BridgeClient
 import com.voice.actonsay.asr.AsrManager
 import com.voice.actonsay.media.MusicPlayer
 import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.conflate
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import org.json.JSONObject
 
 /** 与录音服务独立，语音待机停止后后台任务仍继续。 */
@@ -23,6 +25,10 @@ class AgentTaskService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var foregroundReady = false
     private val announced = mutableSetOf<String>()
+    private val observedStates = mutableMapOf<String, String>()
+    private val startedAt = System.currentTimeMillis()
+    private var wakeLockRenewal: Job? = null
+    private data class NotificationView(val running: Boolean, val taskId: String?, val text: String)
     private val wakeLock by lazy {
         (getSystemService(POWER_SERVICE) as PowerManager).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "actonsay:tasks")
             .apply { setReferenceCounted(false) }
@@ -42,16 +48,29 @@ class AgentTaskService : Service() {
             return
         }
         TaskRuntime.serviceStarted()
+        // 流式回答每 200 毫秒刷新一次任务列表；通知和唤醒锁只关心是否在运行与展示的进度，去重后至多每秒更新一次。
         scope.launch {
-            TaskRuntime.tasks.collectLatest { tasks ->
-                // 有任务在执行时保持 CPU 唤醒，息屏后模型请求和工具调用才不会被系统休眠打断；带超时以防遗留。
-                if (tasks.any { it.state == TaskStates.RUNNING }) wakeLock.acquire(10 * 60_000L)
-                else if (wakeLock.isHeld) wakeLock.release()
-                // 普通问答回合不占用任务通知，只展示后台任务。
+            TaskRuntime.tasks.map { tasks ->
                 val current = tasks.firstOrNull { it.state == TaskStates.RUNNING && it.visible }
-                manager.notify(ID, notification(current?.progress?.ifBlank { "执行任务" } ?: "等待任务与自动化", current?.id))
-                tasks.filter { it.state in listOf(TaskStates.SUCCEEDED, TaskStates.FAILED) && it.visible }.forEach { task ->
-                    if (announced.add(task.id)) TaskRuntime.announceCompletion(task)
+                NotificationView(tasks.any { it.state == TaskStates.RUNNING }, current?.id, current?.progress?.ifBlank { "执行任务" } ?: "等待任务与自动化")
+            }.distinctUntilChanged().conflate().collect { view ->
+                updateWakeLock(view.running)
+                manager.notify(ID, notification(view.text, view.taskId))
+                delay(1000)
+            }
+        }
+        scope.launch {
+            TaskRuntime.tasks.map { tasks -> tasks.map { it.id to it.state } }.distinctUntilChanged().collect { states ->
+                val byId = TaskRuntime.tasks.value.associateBy { it.id }
+                states.forEach { (id, state) ->
+                    val task = byId[id] ?: return@forEach
+                    val previous = observedStates.put(id, state)
+                    val finished = state in listOf(TaskStates.SUCCEEDED, TaskStates.FAILED)
+                    val transitioned = previous != null && previous !in listOf(TaskStates.SUCCEEDED, TaskStates.FAILED, TaskStates.CANCELLED)
+                    // 首次载入旧记录、向前翻页都不代表刚刚完成。
+                    if (finished && task.visible && (transitioned || task.createdAt >= startedAt) && announced.add(id)) {
+                        TaskRuntime.announceCompletion(task)
+                    }
                 }
             }
         }
@@ -73,7 +92,25 @@ class AgentTaskService : Service() {
         }
         return START_STICKY
     }
+    /** 有任务在执行时保持 CPU 唤醒，息屏后模型请求和工具调用才不会被休眠打断；唤醒锁带超时，长任务期间定期续期。 */
+    private fun updateWakeLock(running: Boolean) {
+        if (running) {
+            if (wakeLockRenewal?.isActive == true) return
+            wakeLockRenewal = scope.launch {
+                while (isActive) {
+                    wakeLock.acquire(10 * 60_000L)
+                    delay(9 * 60_000L)
+                }
+            }
+        } else {
+            wakeLockRenewal?.cancel()
+            wakeLockRenewal = null
+            if (wakeLock.isHeld) wakeLock.release()
+        }
+    }
+
     override fun onDestroy() {
+        wakeLockRenewal?.cancel()
         if (wakeLock.isHeld) wakeLock.release()
         TaskRuntime.serviceStopped()
         scope.cancel()

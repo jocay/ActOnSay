@@ -42,6 +42,8 @@ import com.voice.actonsay.ui.screens.settings.SkillsSettingsScreen
 import com.voice.actonsay.ui.screens.settings.PermissionsSettingsScreen
 import com.voice.actonsay.ui.screens.settings.MemorySettingsScreen
 import com.voice.actonsay.ui.screens.settings.WebSettingsScreen
+import com.voice.actonsay.ui.screens.settings.PhonePermissionsScreen
+import com.voice.actonsay.ui.screens.settings.DiagnosticsScreen
 
 enum class Tab(val label: String, val icon: ImageVector) {
     HOME("对话", AppIcons.Chat),
@@ -115,6 +117,8 @@ fun ActOnSayApp(openTasksRequest: Int = 0) {
                     SettingsPage.PERMISSIONS -> PermissionsSettingsScreen(onBack = { settingsPage = null })
                     SettingsPage.MEMORY -> MemorySettingsScreen(onBack = { settingsPage = null })
                     SettingsPage.WEB -> WebSettingsScreen(onBack = { settingsPage = null })
+                    SettingsPage.PHONE_PERMISSIONS -> PhonePermissionsScreen(onBack = { settingsPage = null })
+                    SettingsPage.DIAGNOSTICS -> DiagnosticsScreen(onBack = { settingsPage = null })
                 }
             }
         }

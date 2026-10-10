@@ -15,6 +15,10 @@ object TaskStates {
     const val FAILED = "FAILED"
     const val CANCELLED = "CANCELLED"
     const val RESULT_UNKNOWN = "RESULT_UNKNOWN"
+    /** 已请求取消，等待执行环境确认真正停止；确认前不显示为“已取消”。 */
+    const val CANCELLING = "CANCELLING"
+    /** 用户已取消（含等待执行端确认），本地结果不再覆盖。 */
+    fun cancelRequested(state: String) = state == CANCELLED || state == CANCELLING
 }
 
 @Entity(tableName = "tasks", indices = [Index(value = ["triggerId"], unique = true)])
@@ -62,18 +66,51 @@ data class MigrationMarker(@PrimaryKey val name: String, val completedAt: Long)
 
 @Dao
 interface TaskDao {
-    @Query("SELECT * FROM tasks ORDER BY createdAt DESC") fun observeTasks(): Flow<List<TaskRecord>>
+    // 列表只读取展示字段；执行和恢复仍通过 task()/queued() 读取完整快照。
+    @Query("""SELECT id, goal, state, progress, answer, error, createdAt, updatedAt, conversationId, source,
+        '[]' AS historyJson, '{}' AS configSnapshot, workDir, triggerId, remoteExecutionId, triggerAcknowledged, visible
+        FROM tasks WHERE id IN (SELECT id FROM tasks ORDER BY createdAt DESC LIMIT :limit)
+        OR state NOT IN ('SUCCEEDED','FAILED','CANCELLED')
+        OR id IN (SELECT taskId FROM messages WHERE taskId != '') ORDER BY createdAt DESC""")
+    fun observeTasks(limit: Int): Flow<List<TaskRecord>>
+    @Query("SELECT COUNT(*) FROM tasks") fun observeTaskCount(): Flow<Int>
+    @Query("""SELECT * FROM tasks WHERE triggerId IS NOT NULL AND state IN ('SUCCEEDED','FAILED','CANCELLED','RESULT_UNKNOWN')
+        AND NOT EXISTS (SELECT 1 FROM preferences WHERE `key` = '_trigger_synced_' || tasks.id AND value = tasks.state)""")
+    suspend fun unsyncedTriggers(): List<TaskRecord>
     @Query("SELECT * FROM tasks WHERE id = :id") suspend fun task(id: String): TaskRecord?
     @Query("SELECT * FROM tasks WHERE triggerId = :id LIMIT 1") suspend fun trigger(id: String): TaskRecord?
     @Query("SELECT * FROM tasks WHERE state = 'QUEUED' ORDER BY createdAt") suspend fun queued(): List<TaskRecord>
     @Query("SELECT * FROM tasks WHERE state = 'RUNNING'") suspend fun running(): List<TaskRecord>
     @Query("SELECT * FROM tasks WHERE state = 'WAITING_APP'") suspend fun waitingApp(): List<TaskRecord>
+    @Query("SELECT * FROM tasks WHERE state = 'CANCELLING'") suspend fun cancelling(): List<TaskRecord>
     @Insert(onConflict = OnConflictStrategy.IGNORE) suspend fun insertTask(task: TaskRecord): Long
     @Update suspend fun updateTask(task: TaskRecord)
     @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun conversation(row: ConversationRecord)
     @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun messages(rows: List<MessageRecord>)
     @Query("SELECT * FROM messages WHERE conversationId = :id ORDER BY timestamp") suspend fun messagesFor(id: String): List<MessageRecord>
     @Query("DELETE FROM messages WHERE conversationId = :id") suspend fun clearMessages(id: String)
+    @Query("DELETE FROM messages WHERE id IN (:ids)") suspend fun deleteMessages(ids: List<String>)
+    @Query("SELECT * FROM conversations ORDER BY updatedAt DESC") fun observeConversations(): Flow<List<ConversationRecord>>
+    @Query("SELECT * FROM conversations WHERE id = :id") suspend fun conversationById(id: String): ConversationRecord?
+    @Query("DELETE FROM conversations WHERE id = :id") suspend fun deleteConversation(id: String)
+    @Query("DELETE FROM conversations") suspend fun deleteAllConversations()
+    @Query("DELETE FROM messages") suspend fun deleteAllMessages()
+    @Query("""SELECT * FROM messages WHERE content LIKE '%' || :query || '%' ESCAPE '\'
+        AND content != '' ORDER BY timestamp DESC LIMIT :limit""")
+    suspend fun searchMessages(query: String, limit: Int): List<MessageRecord>
+    @Query("""SELECT * FROM tasks WHERE updatedAt < :before AND source != 'script'
+        AND state IN ('SUCCEEDED','FAILED','CANCELLED')
+        AND id NOT IN (SELECT taskId FROM messages WHERE taskId != '')
+        AND (triggerId IS NULL OR EXISTS (SELECT 1 FROM preferences WHERE `key` = '_trigger_synced_' || tasks.id AND value = tasks.state))""")
+    suspend fun cleanupCandidates(before: Long): List<TaskRecord>
+    @Query("DELETE FROM tasks WHERE id = :id") suspend fun deleteTask(id: String)
+    @Query("DELETE FROM tool_calls WHERE taskId = :id") suspend fun deleteCalls(id: String)
+    @Query("DELETE FROM task_events WHERE taskId = :id") suspend fun deleteEvents(id: String)
+    @Query("DELETE FROM checkpoints WHERE taskId = :id") suspend fun deleteCheckpoint(id: String)
+    @Query("DELETE FROM authorizations WHERE taskId = :id") suspend fun deleteAuthorizations(id: String)
+    @Query("""SELECT messages FROM checkpoints UNION SELECT encryptedArguments FROM tool_calls
+        UNION SELECT encryptedResult FROM tool_calls""") suspend fun payloadReferences(): List<String>
+    @Query("SELECT configSnapshot FROM tasks") suspend fun configSnapshots(): List<String>
     @Query("SELECT * FROM tool_calls WHERE taskId = :id ORDER BY updatedAt") fun observeCalls(id: String): Flow<List<ToolCallRecord>>
     @Query("SELECT * FROM tool_calls WHERE taskId = :id") suspend fun calls(id: String): List<ToolCallRecord>
     @Query("SELECT * FROM tool_calls WHERE id = :id") suspend fun call(id: String): ToolCallRecord?

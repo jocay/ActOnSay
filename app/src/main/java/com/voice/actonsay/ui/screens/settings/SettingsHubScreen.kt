@@ -36,7 +36,7 @@ import com.voice.actonsay.ui.components.SectionCard
 import com.voice.actonsay.ui.components.SettingNavRow
 import com.voice.actonsay.ui.icons.AppIcons
 
-enum class SettingsPage { AI, ASR, TTS, WAKE_WORDS, APPEARANCE, ABOUT, EXECUTION, MCP, SKILLS, PERMISSIONS, MEMORY, WEB }
+enum class SettingsPage { AI, ASR, TTS, WAKE_WORDS, APPEARANCE, ABOUT, EXECUTION, MCP, SKILLS, PERMISSIONS, MEMORY, WEB, PHONE_PERMISSIONS, DIAGNOSTICS }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -126,6 +126,7 @@ fun SettingsHubScreen(onOpen: (SettingsPage) -> Unit) {
                 SettingNavRow("MCP 服务", "stdio、HTTP、工具、资源与提示词", AppIcons.Extension, onClick = { onOpen(SettingsPage.MCP) })
                 SettingNavRow("Skills", "导入、按需加载与版本管理", AppIcons.Skill, onClick = { onOpen(SettingsPage.SKILLS) })
                 SettingNavRow("权限与任务预算", "Android Root、Debian 执行和高度自主模式", AppIcons.Key, onClick = { onOpen(SettingsPage.PERMISSIONS) })
+                SettingNavRow("手机权限", "通讯录、日历、电话、短信、通知读取等系统授权", AppIcons.Tune, onClick = { onOpen(SettingsPage.PHONE_PERMISSIONS) })
                 SettingNavRow("长期偏好与项目备注", "明确记住后用于后续任务", AppIcons.History, onClick = { onOpen(SettingsPage.MEMORY) })
             }
 
@@ -135,6 +136,12 @@ fun SettingsHubScreen(onOpen: (SettingsPage) -> Unit) {
                     subtitle = "主题、动态取色、自动待机、屏幕常亮",
                     icon = AppIcons.Palette,
                     onClick = { onOpen(SettingsPage.APPEARANCE) }
+                )
+                SettingNavRow(
+                    title = "诊断",
+                    subtitle = if (state.diagnosticsEnabled) "记录中 · 各环节耗时与失败原因" else "关闭 · 开启后记录各环节耗时与失败原因",
+                    icon = AppIcons.GraphicEq,
+                    onClick = { onOpen(SettingsPage.DIAGNOSTICS) }
                 )
                 SettingNavRow(
                     title = "关于与数据",

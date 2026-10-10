@@ -17,6 +17,7 @@ import com.voice.actonsay.ai.ToolCall
 import com.voice.actonsay.bridge.BridgeClient
 import com.voice.actonsay.agent.tools.DebianExecutionTool
 import com.voice.actonsay.agent.tools.McpCallExecution
+import com.voice.actonsay.diagnostics.Diagnostics
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Mutex
@@ -34,7 +35,8 @@ object TaskRuntime {
     private val recordMutex = Mutex()
     private val bridgeSyncMutex = Mutex()
     private val ownerMutex = Mutex()
-    private val jobs = mutableMapOf<String, Job>()
+    /** 并发表：资源租约等会在锁外查询任务是否仍在运行。 */
+    private val jobs = java.util.concurrent.ConcurrentHashMap<String, Job>()
     /** true 表示占用前台回合槽，false 表示占用后台任务槽。 */
     private val jobSlots = mutableMapOf<String, Boolean>()
     private val toolsStarted = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicInteger>()
@@ -47,6 +49,11 @@ object TaskRuntime {
     private const val FOREGROUND_TOOL_BUDGET = 6
     private const val FOREGROUND_SECONDS_BUDGET = 45
     private val _tasks = MutableStateFlow<List<TaskRecord>>(emptyList())
+    private val taskPageSize = MutableStateFlow(100)
+    private val liveAnswers = MutableStateFlow<Map<String, String>>(emptyMap())
+    private val _taskCount = MutableStateFlow(0)
+    val taskCount: StateFlow<Int> = _taskCount.asStateFlow()
+    fun loadMoreTasks() { taskPageSize.update { it + 100 } }
     val tasks: StateFlow<List<TaskRecord>> = _tasks.asStateFlow()
     private val _preferences = MutableStateFlow<List<PreferenceRecord>>(emptyList())
     val preferences: StateFlow<List<PreferenceRecord>> = _preferences.asStateFlow()
@@ -76,7 +83,14 @@ object TaskRuntime {
                         progress = "任务中断，可检查记录后恢复", updatedAt = System.currentTimeMillis()))
                 }
                 ready.complete(Unit)
-                launch { dao.observeTasks().collect { _tasks.value = it } }
+                launch {
+                    taskPageSize.collectLatest { limit ->
+                        combine(dao.observeTasks(limit), liveAnswers) { rows, answers ->
+                            rows.map { row -> if (row.state == TaskStates.RUNNING && answers.containsKey(row.id)) row.copy(answer = answers.getValue(row.id)) else row }
+                        }.collect { _tasks.value = it }
+                    }
+                }
+                launch { dao.observeTaskCount().collect { _taskCount.value = it } }
                 launch { dao.observePreferences().collect { _preferences.value = it.filterNot { pref -> pref.key.startsWith("_") } } }
             } catch (error: Exception) {
                 _serviceError.value = "任务数据库初始化失败：${error.message}"
@@ -146,20 +160,73 @@ object TaskRuntime {
         return persistedId
     }
 
+    fun isRunning(id: String): Boolean = jobs[id]?.isActive == true
+
+    /**
+     * 取消分两步：本地立即停止模型与工具循环；涉及 Debian 或 MCP 的执行先标为“正在取消”，
+     * 执行端确认已停止后才改为“已取消”。请求未送达时保留待确认状态，由周期同步重试。
+     */
     fun cancel(id: String) { scope.launch {
         ready.await()
-        dao.task(id)?.remoteExecutionId?.takeIf { it.isNotBlank() }?.let { executionId ->
-            runCatching { BridgeClient.request("POST", "/v1/executions/$executionId/cancel") }
-        }
-        update(id) { it.copy(state = TaskStates.CANCELLED, progress = "已取消") }
+        val task = dao.task(id) ?: return@launch
+        if (task.state in setOf(TaskStates.SUCCEEDED, TaskStates.FAILED, TaskStates.CANCELLED)) return@launch
+        val remote = remoteExecutions(task)
+        update(id) { if (remote.isEmpty()) it.copy(state = TaskStates.CANCELLED, progress = "已取消")
+            else it.copy(state = TaskStates.CANCELLING, progress = "正在取消，等待执行环境确认", error = "") }
         queueMutex.withLock { jobs[id]?.cancel(CancellationException("USER_CANCELLED")) }
-        dao.calls(id).filter { it.executionId.isNotBlank() && it.state in listOf("RUNNING", "RESULT_UNKNOWN") }.forEach { call ->
-            val path = if (call.executionId.startsWith("mcp:")) "/v1/mcp-calls/${call.executionId.removePrefix("mcp:")}/cancel"
-                else "/v1/executions/${call.executionId}/cancel"
-            runCatching { BridgeClient.request("POST", path) }
-        }
-        event(id, "CANCELLED", "用户取消任务")
+        event(id, if (remote.isEmpty()) "CANCELLED" else "CANCEL_REQUESTED", "用户取消任务")
+        if (remote.isNotEmpty()) confirmRemoteCancel(id)
     } }
+
+    /** 任务关联的远端执行：脚本任务的执行，以及尚未得到确定结果的工具调用。 */
+    private suspend fun remoteExecutions(task: TaskRecord): List<String> = buildList {
+        if (task.remoteExecutionId.isNotBlank()) add(task.remoteExecutionId)
+        dao.calls(task.id).filter { it.executionId.isNotBlank() && it.state in listOf("RUNNING", TaskStates.RESULT_UNKNOWN) }
+            .forEach { add(it.executionId) }
+    }.distinct()
+
+    /** 向执行端发送取消并核实结果；全部已结束才把任务改为已取消。 */
+    private suspend fun confirmRemoteCancel(id: String) {
+        val task = dao.task(id) ?: return
+        if (task.state != TaskStates.CANCELLING) return
+        var unconfirmed = 0
+        var unreachable = false
+        val finals = setOf("succeeded", "failed", "cancelled", "result_unknown")
+        val confirmed = mutableMapOf<String, String>()
+        for (executionId in remoteExecutions(task)) {
+            val mcp = executionId.startsWith("mcp:")
+            val base = if (mcp) "/v1/mcp-calls/${executionId.removePrefix("mcp:")}" else "/v1/executions/$executionId"
+            try {
+                val reply = BridgeClient.request("POST", "$base/cancel")
+                // MCP 调用的完整结果可能不带状态字段，带内容即表示已经结束。
+                val status = reply.optString("status").ifBlank { if (mcp && reply.has("content")) "succeeded" else "" }
+                if (status in finals) confirmed[executionId] = status else unconfirmed++
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: com.voice.actonsay.bridge.BridgeException) {
+                // 执行端已没有这条记录，视为不在运行。
+                if (error.statusCode == 404) confirmed[executionId] = "cancelled" else { unconfirmed++; unreachable = true }
+            } catch (_: Exception) {
+                unconfirmed++
+                unreachable = true
+            }
+        }
+        if (unconfirmed == 0) {
+            dao.calls(id).filter { it.state == "RUNNING" && it.executionId in confirmed }.forEach { call ->
+                dao.saveCall(call.copy(state = confirmed.getValue(call.executionId).uppercase(), updatedAt = System.currentTimeMillis()))
+            }
+            update(id) { if (it.state == TaskStates.CANCELLING) it.copy(state = TaskStates.CANCELLED, progress = "已取消", error = "") else it }
+            event(id, "CANCELLED", "执行环境已确认停止")
+        } else {
+            update(id) { if (it.state == TaskStates.CANCELLING) it.copy(error = if (unreachable)
+                "取消请求暂未送达执行环境，命令可能仍在运行；重连后会自动重试" else "执行环境仍在停止进程，稍后再次确认") else it }
+        }
+    }
+
+    /** 周期同步时补发尚未确认的取消。 */
+    private suspend fun retryPendingCancels() {
+        dao.cancelling().forEach { confirmRemoteCancel(it.id) }
+    }
     fun resume(id: String) { scope.launch {
         ready.await()
         val row = dao.task(id) ?: return@launch
@@ -167,7 +234,7 @@ object TaskRuntime {
             update(id) { it.copy(error = "固定脚本已经提交到 Debian，可查看真实执行结果；重跑请使用显式重跑") }
             return@launch
         }
-        if (row.state == TaskStates.RUNNING || row.state == TaskStates.QUEUED || row.state == TaskStates.SUCCEEDED) return@launch
+        if (row.state in setOf(TaskStates.RUNNING, TaskStates.QUEUED, TaskStates.SUCCEEDED, TaskStates.CANCELLING)) return@launch
         if (row.state == TaskStates.RESULT_UNKNOWN) {
             val calls = dao.calls(id).filter { it.state == TaskStates.RESULT_UNKNOWN }
             if (calls.isEmpty() || calls.any { it.executionId.isBlank() }) {
@@ -308,8 +375,17 @@ object TaskRuntime {
         ready.await()
         if (!serviceRunning) return
         queueMutex.withLock {
-            val completed = jobs.filterValues { !it.isActive }.keys.toList()
+            val completed = jobs.filterValues { it.isCompleted }.keys.toList()
             completed.forEach { jobs.remove(it); jobSlots.remove(it) }
+            // 转后台只改变展示；后台槽空出后才迁移占用，始终最多运行两个任务。
+            if (jobSlots.values.none { !it }) {
+                for ((id, foreground) in jobSlots) {
+                    if (foreground && dao.task(id)?.visible == true) {
+                        jobSlots[id] = false
+                        break
+                    }
+                }
+            }
             val queued = dao.queued()
             for (task in queued) {
                 if (task.source == "script") continue
@@ -326,14 +402,35 @@ object TaskRuntime {
     }
 
     private suspend fun runTask(task: TaskRecord) {
-        update(task.id) { if (it.state == TaskStates.CANCELLED) it else it.copy(state = TaskStates.RUNNING, progress = "任务开始", error = "") }
-        if (dao.task(task.id)?.state == TaskStates.CANCELLED) {
+        update(task.id) { if (TaskStates.cancelRequested(it.state)) it else it.copy(state = TaskStates.RUNNING, progress = "任务开始", error = "") }
+        if (dao.task(task.id)?.state?.let(TaskStates::cancelRequested) != false) {
             queueMutex.withLock { jobs.remove(task.id); jobSlots.remove(task.id) }
             schedule()
             return
         }
         event(task.id, "RUNNING", "任务开始")
+        Diagnostics.taskStarted(task.id)
         var lastDelta = 0L
+        var firstToken = true
+        var lastPersistedAnswer: String? = null
+        // 实时文本走内存；检查点及最终结果仍立即落库，中途文本每两秒保存一次。
+        val answerWriter = scope.launch {
+            while (isActive) {
+                delay(2000)
+                val answer = liveAnswers.value[task.id] ?: continue
+                if (answer != lastPersistedAnswer) {
+                    try {
+                        update(task.id) { if (it.state == TaskStates.RUNNING) it.copy(answer = answer) else it }
+                        lastPersistedAnswer = answer
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        _serviceError.value = "中途回答暂未保存，将在任务结束时再次保存。"
+                        break
+                    }
+                }
+            }
+        }
         val foreground = task.source == "turn" && !task.visible
         val startedAt = System.currentTimeMillis()
         toolsStarted[task.id] = java.util.concurrent.atomic.AtomicInteger(0)
@@ -360,10 +457,16 @@ object TaskRuntime {
             }
             val enrichedConfig = config.copy(systemPrompt = config.systemPrompt + runContext +
                 if (memory.isBlank()) "" else "\n用户明确保存的长期偏好与项目备注：\n$memory")
+            // 排队的回合在真正开始时才确定上下文，排队期间结束的前几轮结果在这里补齐。
+            val history = currentHistory(task)
             val result = withTimeout(config.maxTaskSeconds.coerceIn(30, 86400) * 1000L) {
                 val onDelta: (String) -> Unit = { answer ->
+                    if (firstToken) { firstToken = false; Diagnostics.firstToken(task.id) }
                     val now = System.currentTimeMillis()
-                    if (now - lastDelta > 200) { lastDelta = now; scope.launch { update(task.id) { if (it.state == TaskStates.RUNNING) it.copy(answer = CredentialRedactor.text(answer)) else it } } }
+                    if (now - lastDelta > 200) {
+                        lastDelta = now
+                        liveAnswers.update { it + (task.id to CredentialRedactor.text(answer)) }
+                    }
                 }
                 if (task.source == "chat") {
                     OpenAiClient.chatCompletion(config.baseUrl, config.apiKey, config.model, enrichedConfig.systemPrompt +
@@ -371,9 +474,9 @@ object TaskRuntime {
                         "应用提供的任务状态快照：\n" + tasks.value.filter { it.visible }.take(5).joinToString("\n") {
                             "任务 ${it.id}: ${it.goal.take(200)}；状态${it.state}；进度${it.progress.take(200)}；错误${it.error.take(200)}；已有结果${it.answer.take(1000)}"
                         },
-                        task.goal, parseHistory(task.historyJson), config.stream, onDelta)
+                        task.goal, history, config.stream, onDelta, config.apiFormat)
                 } else {
-                    AgentRunner.run(enrichedConfig, parseHistory(task.historyJson), task.goal, onDelta,
+                    AgentRunner.run(enrichedConfig, history, task.goal, onDelta,
                         onStep = { step -> scope.launch { event(task.id, "STEP", step.render()) } },
                         onProgress = { progress -> scope.launch { update(task.id) { if (it.state == TaskStates.RUNNING) it.copy(progress = progress) else it } } },
                         taskId = task.id, observer = observer(task.id),
@@ -381,12 +484,12 @@ object TaskRuntime {
                 }
             }
             result.fold(onSuccess = { answer ->
-                update(task.id) { if (it.state == TaskStates.CANCELLED) it else it.copy(state = TaskStates.SUCCEEDED, answer = CredentialRedactor.text(answer), progress = "已完成") }
+                update(task.id) { if (TaskStates.cancelRequested(it.state)) it else it.copy(state = TaskStates.SUCCEEDED, answer = CredentialRedactor.text(answer), progress = "已完成") }
                 if (dao.task(task.id)?.state == TaskStates.SUCCEEDED) event(task.id, "SUCCEEDED", answer)
             }, onFailure = { error -> fail(task.id, TaskStates.FAILED, error.message ?: "任务失败") })
         } catch (error: AuthorizationRequired) {
             dao.call("${task.id}:${error.callId}")?.let { dao.saveCall(it.copy(state = "WAITING_CONFIRMATION")) }
-            update(task.id) { if (it.state == TaskStates.CANCELLED) it else it.copy(state = TaskStates.WAITING_CONFIRMATION, progress = "等待确认", error = "请在任务页授权本次工具调用") }
+            update(task.id) { if (TaskStates.cancelRequested(it.state)) it else it.copy(state = TaskStates.WAITING_CONFIRMATION, progress = "等待确认", error = "请在任务页授权本次工具调用") }
             event(task.id, "WAITING_CONFIRMATION", error.callId)
         } catch (_: UncertainToolResult) {
             fail(task.id, TaskStates.RESULT_UNKNOWN, "上次操作结果待确认，不会自动重放")
@@ -394,20 +497,28 @@ object TaskRuntime {
             withContext(NonCancellable) { fail(task.id, TaskStates.FAILED, "任务超出时间预算") }
         } catch (error: CancellationException) {
             withContext(NonCancellable) {
-                if (dao.task(task.id)?.state != TaskStates.CANCELLED) {
-                    update(task.id) { it.copy(state = TaskStates.WAITING_APP, progress = "等待应用恢复") }
-                }
+                update(task.id) { if (TaskStates.cancelRequested(it.state)) it else it.copy(state = TaskStates.WAITING_APP, progress = "等待应用恢复") }
             }
         } catch (error: Exception) {
             fail(task.id, TaskStates.FAILED, error.message ?: "任务失败")
         } finally {
             promoter?.cancel()
             toolsStarted.remove(task.id)
+            // 停止运行即交还浏览器与虚拟屏；等待授权后恢复时会重新申请，并按页面版本要求重新读取。
+            ResourceLeases.releaseAll(task.id)
             withContext(NonCancellable) {
-                val latest = dao.task(task.id)
-                latest?.let { notifyTrigger(it) }
-                queueMutex.withLock { jobs.remove(task.id); jobSlots.remove(task.id) }
-                if (serviceRunning) schedule()
+                answerWriter.cancelAndJoin()
+                try {
+                    val pendingAnswer = liveAnswers.value[task.id]
+                    if (pendingAnswer != null) update(task.id) {
+                        if (it.state != TaskStates.SUCCEEDED) it.copy(answer = pendingAnswer) else it
+                    }
+                    dao.task(task.id)?.let { notifyTrigger(it); Diagnostics.taskFinished(it.id, it.state) }
+                } finally {
+                    liveAnswers.update { it - task.id }
+                    queueMutex.withLock { jobs.remove(task.id); jobSlots.remove(task.id) }
+                    if (serviceRunning) schedule()
+                }
             }
         }
     }
@@ -415,7 +526,8 @@ object TaskRuntime {
     private suspend fun promote(id: String) {
         update(id) { if (it.state == TaskStates.RUNNING) it.copy(visible = true) else it }
         if (dao.task(id)?.visible != true) return
-        queueMutex.withLock { if (jobSlots.containsKey(id)) jobSlots[id] = false }
+        // 后台槽已占用时保留原槽，让当前操作继续完成，后续前台请求排队。
+        queueMutex.withLock { if (jobSlots.containsKey(id) && jobSlots.values.none { !it }) jobSlots[id] = false }
         event(id, "PROMOTED", "前台回合超出预算，已转为后台任务继续执行")
         schedule()
     }
@@ -443,6 +555,7 @@ object TaskRuntime {
                 if (old.name !in REPLAYABLE_TOOLS) throw UncertainToolResult()
             }
             toolsStarted[taskId]?.incrementAndGet()
+            Diagnostics.toolStarted(taskId, call.id)
             val displayArguments = runCatching { CredentialRedactor.json(JSONObject(call.arguments)).toString() }.getOrElse { "参数无效" }
             dao.saveCall(ToolCallRecord("$taskId:${call.id}", taskId, call.name, displayArguments, "RUNNING",
                 encryptedArguments = TaskSecretVault.encrypt(call.arguments)))
@@ -450,6 +563,8 @@ object TaskRuntime {
             return null
         }
         override suspend fun finishTool(call: ToolCall, result: ToolResult) {
+            Diagnostics.toolFinished(taskId, call.id, call.name, result.status)
+            if (!result.ok && result.errorType != null) Diagnostics.failure("工具 ${call.name}", "${result.errorType}：${result.output.take(200)}")
             val old = dao.call("$taskId:${call.id}") ?: return
             dao.saveCall(old.copy(state = result.status, result = result.displayJson().toString(),
                 encryptedResult = TaskSecretVault.encrypt(result.toJson().toString()),
@@ -477,7 +592,40 @@ object TaskRuntime {
         dao.event(TaskEvent(UUID.randomUUID().toString(), id, type, CredentialRedactor.text(content)))
     }
     private suspend fun fail(id: String, state: String, error: String) {
-        update(id) { if (it.state == TaskStates.CANCELLED) it else it.copy(state = state, error = CredentialRedactor.text(error), progress = CredentialRedactor.text(error)) }; event(id, state, error)
+        update(id) { if (TaskStates.cancelRequested(it.state)) it else it.copy(state = state, error = CredentialRedactor.text(error), progress = CredentialRedactor.text(error)) }; event(id, state, error)
+        Diagnostics.failure(if (state == TaskStates.RESULT_UNKNOWN) "结果待确认" else "任务执行", error)
+    }
+
+    /**
+     * 前台回合按聊天记录重建上下文：排在前面的回合此时已经结束，用它的最终结果代替提交时还在加载的空回复；
+     * 已转后台仍在执行的，说明其状态。找不到对应聊天记录时（例如刚提交就立即执行）沿用提交时的快照。
+     */
+    private suspend fun currentHistory(task: TaskRecord): List<ChatTurn> {
+        val snapshot = parseHistory(task.historyJson)
+        if (task.source !in FOREGROUND_SOURCES) return snapshot
+        val rows = dao.messagesFor(task.conversationId)
+        val own = rows.indexOfLast { it.taskId == task.id }
+        val userIndex = (own - 1 downTo 0).firstOrNull { rows[it].role == "user" } ?: return snapshot
+        val limit = maxOf(snapshot.size, com.voice.actonsay.asr.AsrManager.state.value.aiContextTurns * 2)
+        if (limit <= 0) return emptyList()
+        val turns = mutableListOf<ChatTurn>()
+        for (row in rows.subList(0, userIndex)) {
+            val meta = runCatching { JSONObject(row.metadata) }.getOrDefault(JSONObject())
+            if (row.role == "user") {
+                if (row.content.isNotBlank() && !meta.optBoolean("error")) turns += ChatTurn("user", row.content)
+                continue
+            }
+            val linked = row.taskId.takeIf { it.isNotBlank() }?.let { dao.task(it) }
+            val content = when {
+                linked == null -> row.content.takeIf { !meta.optBoolean("loading") && !meta.optBoolean("error") }
+                linked.state == TaskStates.SUCCEEDED -> linked.answer
+                linked.visible && linked.state in setOf(TaskStates.QUEUED, TaskStates.RUNNING, TaskStates.WAITING_CONFIRMATION, TaskStates.WAITING_APP) ->
+                    "（这条请求已转为后台任务 ${linked.id}，仍在执行，结果可用 get_task 查询）"
+                else -> null
+            }
+            if (!content.isNullOrBlank()) turns += ChatTurn("assistant", content)
+        }
+        return turns.takeLast(limit)
     }
     private suspend fun notifyTrigger(task: TaskRecord) {
         if (task.triggerId == null || task.state !in listOf(TaskStates.SUCCEEDED, TaskStates.FAILED, TaskStates.CANCELLED, TaskStates.RESULT_UNKNOWN)) return
@@ -496,7 +644,49 @@ object TaskRuntime {
     }
     suspend fun syncTriggerResults() {
         ready.await()
-        tasks.value.filter { it.triggerId != null }.forEach { notifyTrigger(it) }
+        dao.unsyncedTriggers().forEach { notifyTrigger(it) }
+    }
+
+    /** 只由数据管理页显式调用；保留活动任务、聊天引用及尚未同步的自动化结果。 */
+    suspend fun clearFinishedHistory(olderThanDays: Int): Int {
+        ready.await()
+        require(olderThanDays in setOf(7, 30, 90))
+        val app = context ?: return 0
+        val root = File(app.filesDir, "tasks").canonicalFile
+        val before = System.currentTimeMillis() - olderThanDays * 86_400_000L
+        fun deleteFiles(file: File): Boolean {
+            // 不跟随任务脚本留下的符号链接，也不触及其他任务目录。
+            if (file.canonicalFile != file.absoluteFile) return false
+            if (file.isDirectory) {
+                val children = file.listFiles() ?: return false
+                if (!children.all { deleteFiles(it) }) return false
+            }
+            return file.delete()
+        }
+        return queueMutex.withLock {
+            recordMutex.withLock {
+                var removed = 0
+                for (candidate in dao.cleanupCandidates(before)) {
+                    if (jobs.containsKey(candidate.id)) continue
+                    // 数据库只提供 ID，绝不信任存储的 workDir 作为删除路径。
+                    if (!candidate.id.matches(Regex("[A-Za-z0-9_-]{1,128}"))) continue
+                    val directory = File(root, candidate.id)
+                    if (directory.canonicalFile != directory || directory.parentFile != root) continue
+                    if (directory.exists() && !deleteFiles(directory)) continue
+                    TaskRepository.database.withTransaction {
+                        dao.deleteCalls(candidate.id)
+                        dao.deleteEvents(candidate.id)
+                        dao.deleteCheckpoint(candidate.id)
+                        dao.deleteAuthorizations(candidate.id)
+                        dao.deleteTask(candidate.id)
+                    }
+                    removed++
+                }
+                val references = dao.payloadReferences() + dao.configSnapshots().map { JSONObject(it).optString("encryptedApiKey") }
+                TaskSecretVault.pruneUnreferenced(references, before)
+                removed
+            }
+        }
     }
     fun announceCompletion(task: TaskRecord) { scope.launch {
         ready.await()
@@ -546,6 +736,7 @@ object TaskRuntime {
     suspend fun syncBridge() = bridgeSyncMutex.withLock {
         ready.await()
         BridgeClient.health()
+        retryPendingCancels()
         syncAutomationPause()
         syncTriggerResults()
         if (!_automationPaused.value) {
@@ -593,7 +784,10 @@ object TaskRuntime {
             val taskId = execution.optString("task_id").ifBlank { "execution-$executionId" }
             val old = dao.task(taskId)
             if (old != null && old.source != "script") return
-            val state = execution.optString("status").uppercase().let { if (it == "QUEUED") TaskStates.QUEUED else it }
+            val remoteState = execution.optString("status").uppercase().let { if (it == "STARTING") TaskStates.RUNNING else it }
+            // 用户已请求取消时，执行端结束前保持“正在取消”，不被周期同步改回执行中。
+            val state = if (old?.state == TaskStates.CANCELLING && remoteState !in setOf(TaskStates.SUCCEEDED, TaskStates.FAILED,
+                    TaskStates.CANCELLED, TaskStates.RESULT_UNKNOWN)) TaskStates.CANCELLING else remoteState
             // 周期同步会重复拿到同一批执行；状态未变化时不重写记录，避免无意义的落库与界面刷新。
             if (old != null && old.state == state && old.remoteExecutionId == executionId && dao.call("$taskId:execution")?.state == state) return
             val row =(old ?: TaskRecord(taskId, CredentialRedactor.text(execution.optString("label", "Debian 执行").take(120)),
@@ -613,7 +807,7 @@ object TaskRuntime {
     private fun snapshot(config: AgentConfig): String {
         CredentialRedactor.remember(config.apiKey)
         return JSONObject().put("baseUrl", config.baseUrl).put("model", config.model)
-        .put("systemPrompt", config.systemPrompt).put("stream", config.stream)
+        .put("systemPrompt", config.systemPrompt).put("stream", config.stream).put("apiFormat", config.apiFormat.name)
         .put("encryptedApiKey", TaskSecretVault.encrypt(config.apiKey)).put("maxSteps", config.maxSteps)
         .put("maxContextChars", config.maxContextChars).put("maxTaskSeconds", config.maxTaskSeconds).put("supportsImages", config.supportsImages).toString()
     }
@@ -623,7 +817,8 @@ object TaskRuntime {
         CredentialRedactor.remember(key)
         return AgentConfig(value.getString("baseUrl"), key,
             value.getString("model"), value.optString("systemPrompt"), value.optBoolean("stream"),
-            value.optInt("maxSteps", 30), value.optInt("maxContextChars", 60000), value.optInt("maxTaskSeconds", 1800), value.optBoolean("supportsImages", false))
+            value.optInt("maxSteps", 30), value.optInt("maxContextChars", 60000), value.optInt("maxTaskSeconds", 1800), value.optBoolean("supportsImages", false),
+            com.voice.actonsay.ai.AiApiFormat.from(value.optString("apiFormat")))
     }
     private fun parseHistory(json: String): List<ChatTurn> {
         val rows = JSONArray(json)

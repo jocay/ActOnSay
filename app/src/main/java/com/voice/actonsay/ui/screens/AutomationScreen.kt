@@ -11,7 +11,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
@@ -43,7 +42,6 @@ import com.voice.actonsay.ui.components.encodeBridgePath
 import com.voice.actonsay.ui.components.objectList
 import kotlinx.coroutines.launch
 import org.json.JSONObject
-import java.util.TimeZone
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -140,13 +138,8 @@ fun AutomationScreen() {
                             } })
                         }
                         Text(if (schedule.optString("kind") == "ai") "AI 目标 · ${schedule.optString("goal")}" else "固定脚本 · ${schedule.optString("command")}", style = MaterialTheme.typography.bodySmall)
-                        val expression = when (schedule.optString("schedule_type")) {
-                            "once" -> "一次性：${schedule.optString("run_at")}"
-                            "interval" -> "每 ${schedule.optLong("interval_seconds")} 秒"
-                            else -> "Cron：${schedule.optString("cron")}"
-                        }
-                        Text("${schedule.optString("timezone")} · $expression", style = MaterialTheme.typography.bodySmall)
-                        Text("下一次：${schedule.optString("next_run").takeUnless { it.isBlank() || it == "null" } ?: "无待执行时间"}", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall)
+                        Text("${describeSchedule(schedule)} · ${schedule.optString("timezone")}", style = MaterialTheme.typography.bodySmall)
+                        Text("下一次：${describeNextRun(schedule) ?: "无待执行时间"}", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall)
                         Row {
                             TextButton(onClick = { editing = schedule; editorOpen = true }) { Text("编辑") }
                             TextButton(onClick = { deleting = schedule }) { Text("删除") }
@@ -192,74 +185,4 @@ fun AutomationScreen() {
             }
         }
     }
-}
-
-@Composable
-private fun ScheduleEditor(schedule: JSONObject?, busy: Boolean, requestError: String, onDismiss: () -> Unit, onSave: (JSONObject) -> Unit) {
-    val id = schedule?.optString("id").orEmpty()
-    var name by rememberSaveable(id) { mutableStateOf(schedule?.optString("name").orEmpty()) }
-    var kind by rememberSaveable(id) { mutableStateOf(schedule?.optString("kind") ?: "ai") }
-    var type by rememberSaveable(id) { mutableStateOf(schedule?.optString("schedule_type") ?: "once") }
-    var timezone by rememberSaveable(id) { mutableStateOf(schedule?.optString("timezone") ?: TimeZone.getDefault().id) }
-    var runAt by rememberSaveable(id) { mutableStateOf(schedule?.optString("run_at").orEmpty()) }
-    var interval by rememberSaveable(id) { mutableStateOf(schedule?.optLong("interval_seconds", 3600)?.toString() ?: "3600") }
-    var cron by rememberSaveable(id) { mutableStateOf(schedule?.optString("cron") ?: "0 9 * * *") }
-    var content by rememberSaveable(id) { mutableStateOf(schedule?.optString(if (kind == "ai") "goal" else "command").orEmpty()) }
-    var cwd by rememberSaveable(id) { mutableStateOf(schedule?.optString("cwd").orEmpty()) }
-    var skip by rememberSaveable(id) { mutableStateOf(schedule?.optString("misfire_policy") == "skip") }
-    var localError by remember { mutableStateOf("") }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(if (schedule == null) "新建定时任务" else "编辑定时任务") },
-        text = {
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                item { BridgeTextField(name, { name = it }, "名称", true) }
-                item { Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(selected = kind == "ai", onClick = { kind = "ai" }, label = { Text("AI 目标") })
-                    FilterChip(selected = kind == "script", onClick = { kind = "script" }, label = { Text("固定脚本") })
-                } }
-                item { BridgeTextField(content, { content = it }, if (kind == "ai") "目标" else "Debian Bash 脚本") }
-                item { Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    listOf("once" to "一次", "interval" to "间隔", "cron" to "Cron").forEach { (value, label) ->
-                        FilterChip(selected = type == value, onClick = { type = value }, label = { Text(label) })
-                    }
-                } }
-                item { BridgeTextField(timezone, { timezone = it }, "时区", true) }
-                item { when (type) {
-                    "once" -> BridgeTextField(runAt, { runAt = it }, "ISO 时间，如 2026-10-03T09:00:00+08:00", true)
-                    "interval" -> BridgeTextField(interval, { interval = it }, "间隔秒数（至少 60）", true)
-                    else -> BridgeTextField(cron, { cron = it }, "Cron：分 时 日 月 星期（mon–sun 或 *）", true)
-                } }
-                if (kind == "script") item { BridgeTextField(cwd, { cwd = it }, "工作目录（可选）", true) }
-                item { Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("错过后跳过补跑", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
-                    Switch(checked = skip, onCheckedChange = { skip = it })
-                } }
-                item { Text("${timezone} · ${if (skip) "跳过错过的触发" else "24 小时内合并补跑最近一次"}。保存后以服务返回的下一次时间为准。", style = MaterialTheme.typography.bodySmall) }
-                if (localError.isNotBlank()) item { BridgeMessage(localError, true) }
-                if (requestError.isNotBlank()) item { BridgeMessage(requestError, true) }
-            }
-        },
-        confirmButton = { TextButton(enabled = !busy, onClick = {
-            when {
-                name.isBlank() || content.isBlank() -> localError = "名称和执行内容不能为空"
-                timezone !in TimeZone.getAvailableIDs() -> localError = "请输入有效时区，例如 Asia/Shanghai"
-                type == "once" && runAt.isBlank() -> localError = "请输入一次性执行时间"
-                type == "interval" && (interval.toLongOrNull() ?: 0) < 60 -> localError = "间隔需至少 60 秒"
-                type == "cron" && cron.trim().split(Regex("\\s+")).size != 5 -> localError = "Cron 需要 5 个字段"
-                type == "cron" && cron.trim().split(Regex("\\s+")).last().any { it.isDigit() } -> localError = "星期请使用 mon、tue、wed、thu、fri、sat、sun 或 *"
-                else -> {
-                    localError = ""
-                    val body = JSONObject().put("name", name.trim()).put("kind", kind).put("schedule_type", type)
-                        .put("timezone", timezone.trim()).put("enabled", schedule?.optBoolean("enabled") ?: true)
-                        .put("misfire_policy", if (skip) "skip" else "latest").put("catchup_window_seconds", 86400)
-                        .put(if (kind == "ai") "goal" else "command", content)
-                    when (type) { "once" -> body.put("run_at", runAt.trim()); "interval" -> body.put("interval_seconds", interval.toLong()); else -> body.put("cron", cron.trim()) }
-                    if (kind == "script") body.put("cwd", cwd.trim().ifBlank { null } ?: JSONObject.NULL)
-                    onSave(body)
-                }
-            }
-        }) { Text(if (busy) "保存中…" else "保存") } },
-        dismissButton = { TextButton(enabled = !busy, onClick = onDismiss) { Text("取消") } }
-    )
 }

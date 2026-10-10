@@ -11,7 +11,7 @@ object CredentialRedactor {
     private val sensitive = Regex("(?i)(authorization|api[_-]?key|token|password|passwd|secret|credential|cookie)")
     fun knownSecrets(): List<String> {
         val state = AsrManager.state.value
-        return (listOf(state.apiKey, state.aiApiKey, state.mimoApiKey, state.bridgeToken, state.fastDecisionApiKey, state.braveApiKey, state.exaApiKey) + taskSecrets).filter { it.length >= 4 }.distinct()
+        return (listOf(state.apiKey, state.aiApiKey, state.mimoApiKey, state.bridgeToken, state.fastDecisionApiKey, state.braveApiKey, state.exaApiKey) + state.aiProviders.map { it.apiKey } + taskSecrets).filter { it.length >= 4 }.distinct()
     }
     fun text(input: String): String {
         var result = input

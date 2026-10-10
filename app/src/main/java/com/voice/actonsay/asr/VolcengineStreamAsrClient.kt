@@ -74,8 +74,8 @@ class VolcengineStreamAsrClient {
     private val isConnected = AtomicBoolean(false)
     private val isHandshakeFinished = AtomicBoolean(false)
     private val isFinished = AtomicBoolean(false)
-    /** 由调用方主动取消，之后的 onFailure/onClosed 不再向上层报告 */
-    private val isCancelled = AtomicBoolean(false)
+    /** 每次结束会话都使旧连接回调失效，校验与状态更新共用对象锁。 */
+    private var sessionGeneration = 0L
 
     // Pending audio queue while handshake is in progress
     private val pendingAudioQueue = ConcurrentLinkedQueue<Pair<ByteArray, Boolean>>()
@@ -88,13 +88,13 @@ class VolcengineStreamAsrClient {
         wsUrl: String = DEFAULT_WS_URL
     ) {
         cancel()
+        val generation = sessionGeneration
 
         this.listener = listener
         this.sequence.set(1)
         this.isConnected.set(false)
         this.isHandshakeFinished.set(false)
         this.isFinished.set(false)
-        this.isCancelled.set(false)
         this.pendingAudioQueue.clear()
 
         val connectId = UUID.randomUUID().toString()
@@ -108,39 +108,49 @@ class VolcengineStreamAsrClient {
 
         webSocket = okHttpClient.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                Log.i(TAG, "WebSocket connected, sending FULL_CLIENT_REQUEST. connectId=$connectId")
-                isConnected.set(true)
-                sendFullClientRequest(webSocket, connectId)
+                synchronized(this@VolcengineStreamAsrClient) {
+                    if (generation != sessionGeneration) return
+                    Log.i(TAG, "WebSocket connected, sending FULL_CLIENT_REQUEST. connectId=$connectId")
+                    isConnected.set(true)
+                    sendFullClientRequest(webSocket, connectId)
+                }
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                handleServerMessage(webSocket, bytes.toByteArray())
+                synchronized(this@VolcengineStreamAsrClient) {
+                    if (generation != sessionGeneration) return
+                    handleServerMessage(webSocket, bytes.toByteArray())
+                }
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                if (isCancelled.get()) {
-                    Log.i(TAG, "WebSocket failure after cancel, ignored: ${t.message}")
+                synchronized(this@VolcengineStreamAsrClient) {
+                    if (generation != sessionGeneration) return
+                    val errorBody = try { response?.body?.string() } catch (e: Exception) { null }
+                    val code = response?.code ?: -1
+                    val baseMsg = t.message ?: "网络连接异常"
+                    val finalMsg = if (!errorBody.isNullOrEmpty()) "$baseMsg ($errorBody)" else baseMsg
+                    Log.e(TAG, "WebSocket failure: code=$code, msg=$finalMsg", t)
+                    listener.onError(code, finalMsg)
                     cleanup()
-                    return
                 }
-                val errorBody = try { response?.body?.string() } catch (e: Exception) { null }
-                val code = response?.code ?: -1
-                val baseMsg = t.message ?: "网络连接异常"
-                val finalMsg = if (!errorBody.isNullOrEmpty()) "$baseMsg ($errorBody)" else baseMsg
-                Log.e(TAG, "WebSocket failure: code=$code, msg=$finalMsg", t)
-                listener.onError(code, finalMsg)
-                cleanup()
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                Log.i(TAG, "WebSocket closing: $code / $reason")
-                webSocket.close(code, reason)
+                synchronized(this@VolcengineStreamAsrClient) {
+                    if (generation != sessionGeneration) return
+                    Log.i(TAG, "WebSocket closing: $code / $reason")
+                    webSocket.close(code, reason)
+                }
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                Log.i(TAG, "WebSocket closed: $code / $reason")
-                if (!isCancelled.get()) listener.onClosed()
-                cleanup()
+                synchronized(this@VolcengineStreamAsrClient) {
+                    if (generation != sessionGeneration) return
+                    Log.i(TAG, "WebSocket closed: $code / $reason")
+                    listener.onClosed()
+                    cleanup()
+                }
             }
         })
     }
@@ -322,20 +332,24 @@ class VolcengineStreamAsrClient {
         }
     }
 
+    @Synchronized
     fun finish() {
         if (isFinished.get()) return
         sendAudio(ByteArray(0), isLast = true)
     }
 
+    @Synchronized
     fun cancel() {
+        sessionGeneration++
         isFinished.set(true)
-        isCancelled.set(true)
         webSocket?.cancel()
         cleanup()
     }
 
     private fun cleanup() {
+        sessionGeneration++
         webSocket = null
+        listener = null
         isConnected.set(false)
         isHandshakeFinished.set(false)
         pendingAudioQueue.clear()

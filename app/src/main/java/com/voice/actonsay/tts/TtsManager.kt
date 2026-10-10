@@ -7,11 +7,11 @@ import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
+import com.voice.actonsay.diagnostics.Diagnostics
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
@@ -19,6 +19,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import java.io.File
@@ -52,14 +55,23 @@ object TtsManager : TextToSpeech.OnInitListener {
     val isSpeaking: StateFlow<Boolean> = _isSpeaking.asStateFlow()
 
     private var currentOnDone: (() -> Unit)? = null
+    private var systemUtteranceId: String? = null
 
     /** 正在播放的分段文字；打断检测据此忽略播报内容本身含有的打断词或唤醒词。 */
     @Volatile var speakingText: String = ""
         private set
 
     /** [audio] 为空表示用系统 TTS 朗读；[keepFile] 的音频是唤醒应答缓存，播放后保留。 */
-    private class Segment(val text: String, val audio: Deferred<File?>?, val keepFile: Boolean = false)
+    private class Segment(val text: String, var audio: Deferred<File?>? = null, val keepFile: Boolean = false) {
+        var file: File? = null
+        fun dispose() {
+            audio?.cancel()
+            if (!keepFile) file?.delete()
+            file = null
+        }
+    }
     private val queue = ArrayDeque<Segment>()
+    private var activeSegment: Segment? = null
     private var playing = false
     /** 每次 [stop] 递增，使被打断的合成与播放回调失效。 */
     private var generation = 0
@@ -110,21 +122,28 @@ object TtsManager : TextToSpeech.OnInitListener {
 
             engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) {
-                    scope.launch { _isSpeaking.value = true }
+                    scope.launch {
+                        synchronized(this@TtsManager) {
+                            if (utteranceId != null && utteranceId == systemUtteranceId) {
+                                _isSpeaking.value = true
+                                Diagnostics.playbackStarted()
+                            }
+                        }
+                    }
                 }
 
                 override fun onDone(utteranceId: String?) {
-                    scope.launch { segmentFinished(utteranceGeneration(utteranceId)) }
+                    scope.launch { systemSegmentFinished(utteranceId) }
                 }
 
                 @Deprecated("Deprecated in Java")
                 override fun onError(utteranceId: String?) {
-                    scope.launch { segmentFinished(utteranceGeneration(utteranceId)) }
+                    scope.launch { systemSegmentFinished(utteranceId) }
                 }
 
                 override fun onError(utteranceId: String?, errorCode: Int) {
                     Log.e(TAG, "System TTS Utterance error: $errorCode")
-                    scope.launch { segmentFinished(utteranceGeneration(utteranceId)) }
+                    scope.launch { systemSegmentFinished(utteranceId) }
                 }
             })
 
@@ -137,6 +156,13 @@ object TtsManager : TextToSpeech.OnInitListener {
     }
 
     private fun utteranceGeneration(utteranceId: String?): Int = utteranceId?.substringBefore(':')?.toIntOrNull() ?: -1
+
+    @Synchronized
+    private fun systemSegmentFinished(utteranceId: String?) {
+        if (utteranceId == null || utteranceId != systemUtteranceId) return
+        systemUtteranceId = null
+        segmentFinished(utteranceGeneration(utteranceId))
+    }
 
     fun setSpeechRate(rate: Float) {
         speechRate = rate
@@ -197,39 +223,50 @@ object TtsManager : TextToSpeech.OnInitListener {
         val directory = File(context.cacheDir, "tts_segments")
         val rate = speechRate
         fun local(): File? = File(directory, "${UUID.randomUUID()}.wav").takeIf { LocalTts.synthesize(context, text, rate, it) }
-        return when {
-            engineType == TtsEngineType.LOCAL -> Segment(text, scope.async(Dispatchers.Default) { local() })
-            engineType == TtsEngineType.MIMO && mimoApiKey.isNotBlank() -> {
-                val key = mimoApiKey
-                val voice = mimoVoice
-                val style = mimoStylePrompt
-                // 入队即开始合成，多段并行，轮到播放时通常已经就绪；云端失败时该段改用本地离线模型，再不行才交给系统 TTS。
-                Segment(text, scope.async(Dispatchers.IO) {
+        val engine = engineType
+        val key = mimoApiKey
+        val voice = mimoVoice
+        val style = mimoStylePrompt
+        val segment = Segment(text)
+        if (engine == TtsEngineType.SYSTEM || (engine == TtsEngineType.MIMO && key.isBlank() && !LocalTts.installed.value)) return segment
+        val current = generation
+        segment.audio = scope.async(Dispatchers.IO) {
+            var file: File? = null
+            try {
+                ensureActive()
+                file = if (engine == TtsEngineType.MIMO && key.isNotBlank()) {
                     val cloud = mimoSlots.withPermit {
                         MimoTtsClient.synthesize(text = text, apiKey = key, voice = voice, stylePrompt = style, format = "mp3")
                     }
-                    cloud.fold(
-                        onSuccess = { bytes ->
-                            directory.mkdirs()
-                            File(directory, "${UUID.randomUUID()}.mp3").also { it.writeBytes(bytes) }
-                        },
-                        onFailure = { error ->
-                            Log.e(TAG, "MiMo TTS failed, falling back to offline TTS: ${error.message}")
-                            local()
-                        }
-                    )
-                })
+                    ensureActive()
+                    cloud.fold(onSuccess = { bytes ->
+                        directory.mkdirs()
+                        File(directory, "${UUID.randomUUID()}.mp3").also { it.writeBytes(bytes) }
+                    }, onFailure = { error ->
+                        Log.e(TAG, "MiMo TTS failed, falling back to offline TTS: ${error.message}")
+                        Diagnostics.failure("语音合成", "MiMo 合成失败，改用本地模型：${error.message.orEmpty()}")
+                        local()
+                    })
+                } else local()
+                ensureActive()
+                synchronized(this@TtsManager) {
+                    ensureActive()
+                    if (current == generation) segment.file = file else { file?.delete(); file = null }
+                }
+                file
+            } finally {
+                // 本地引擎不能中途终止；返回后仍必须清理已取消分段的产物。
+                if (!isActive) file?.delete()
             }
-            // 系统引擎；设备没有系统 TTS 时由播放阶段跳过。未配置 MiMo 密钥时优先用已安装的离线模型。
-            engineType == TtsEngineType.MIMO && LocalTts.installed.value -> Segment(text, scope.async(Dispatchers.Default) { local() })
-            else -> Segment(text, null)
         }
+        return segment
     }
 
     @Synchronized
     private fun playNext() {
         val current = generation
         val segment = queue.removeFirstOrNull()
+        activeSegment = segment
         if (segment == null) {
             playing = false
             speakingText = ""
@@ -257,12 +294,18 @@ object TtsManager : TextToSpeech.OnInitListener {
         }
     }
 
+    @Synchronized
     private fun segmentFinished(segmentGeneration: Int) {
         if (segmentGeneration != generation) return
+        activeSegment?.dispose()
+        activeSegment = null
         playNext()
     }
 
+    @Synchronized
     private fun playFile(file: File, keepFile: Boolean, fallbackText: String, current: Int) {
+        if (current != generation) { if (!keepFile) file.delete(); return }
+        val segment = activeSegment
         try {
             val player = mediaPlayer ?: MediaPlayer().also { mediaPlayer = it }
             player.reset()
@@ -270,15 +313,16 @@ object TtsManager : TextToSpeech.OnInitListener {
             player.prepare()
             player.setOnCompletionListener {
                 if (!keepFile) file.delete()
-                segmentFinished(current)
+                synchronized(this@TtsManager) { if (activeSegment === segment) segmentFinished(current) }
             }
             player.setOnErrorListener { _, what, extra ->
                 Log.e(TAG, "MediaPlayer error: what=$what, extra=$extra")
                 if (!keepFile) file.delete()
-                segmentFinished(current)
+                synchronized(this@TtsManager) { if (activeSegment === segment) segmentFinished(current) }
                 true
             }
             player.start()
+            Diagnostics.playbackStarted()
         } catch (e: Exception) {
             Log.e(TAG, "Failed to play synthesized audio", e)
             file.delete()
@@ -286,7 +330,9 @@ object TtsManager : TextToSpeech.OnInitListener {
         }
     }
 
+    @Synchronized
     private fun speakWithSystemTts(text: String, current: Int) {
+        if (current != generation) return
         val engine = tts
         if (engine == null || !_isReady.value) {
             Log.w(TAG, "System TTS not ready yet, skipping speak")
@@ -295,24 +341,23 @@ object TtsManager : TextToSpeech.OnInitListener {
         }
 
         val utteranceId = "$current:${UUID.randomUUID()}"
+        systemUtteranceId = utteranceId
         val result = engine.speak(text, TextToSpeech.QUEUE_FLUSH, Bundle(), utteranceId)
         if (result == TextToSpeech.ERROR) {
             Log.e(TAG, "Error invoking System TTS speak")
-            segmentFinished(current)
+            systemSegmentFinished(utteranceId)
         }
     }
 
-    @OptIn(ExperimentalCoroutinesApi::class)
     @Synchronized
     fun stop() {
         generation++
+        systemUtteranceId = null
         currentSynthesisJob?.cancel()
         currentSynthesisJob = null
-        queue.forEach { segment ->
-            val audio = segment.audio ?: return@forEach
-            if (segment.keepFile) return@forEach
-            if (audio.isCompleted && !audio.isCancelled) runCatching { audio.getCompleted()?.delete() } else audio.cancel()
-        }
+        activeSegment?.dispose()
+        activeSegment = null
+        queue.forEach { it.dispose() }
         queue.clear()
         playing = false
         speakingText = ""
@@ -333,24 +378,28 @@ object TtsManager : TextToSpeech.OnInitListener {
         callback?.invoke()
     }
 
-    private fun ackFile(index: Int): File? {
+    private fun ackFile(index: Int, voice: String = mimoVoice, style: String = mimoStylePrompt): File? {
         val context = appContext ?: return null
-        val variant = (mimoVoice + "|" + mimoStylePrompt).hashCode().toUInt().toString(16)
+        val variant = (voice + "|" + style).hashCode().toUInt().toString(16)
         return File(File(context.filesDir, "tts_ack"), "${variant}_$index.mp3")
     }
 
     /** 后台准备当前音色的唤醒应答音频；已存在的不重复合成，失败时下次配置或启动再试。 */
     private fun prepareAcks() {
+        ackJob?.cancel()
         if (engineType != TtsEngineType.MIMO || mimoApiKey.isBlank() || appContext == null) return
         val key = mimoApiKey
         val voice = mimoVoice
         val style = mimoStylePrompt
-        ackJob?.cancel()
         ackJob = scope.launch(Dispatchers.IO) {
+            // 即时配置输入停止后再准备应答，避免每个按键都产生网络请求。
+            delay(800)
             ACK_PHRASES.forEachIndexed { index, phrase ->
-                val target = ackFile(index) ?: return@launch
+                ensureActive()
+                val target = ackFile(index, voice, style) ?: return@launch
                 if (target.length() > 0) return@forEachIndexed
                 MimoTtsClient.synthesize(text = phrase, apiKey = key, voice = voice, stylePrompt = style, format = "mp3").onSuccess { bytes ->
+                    ensureActive()
                     target.parentFile?.mkdirs()
                     val partial = File(target.parentFile, target.name + ".partial")
                     partial.writeBytes(bytes)
@@ -362,6 +411,7 @@ object TtsManager : TextToSpeech.OnInitListener {
 
     @Synchronized
     fun shutdown() {
+        ackJob?.cancel()
         stop()
         mediaPlayer?.release()
         mediaPlayer = null

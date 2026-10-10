@@ -32,6 +32,9 @@ object AgentBrowser {
 
     private var webView: WebView? = null
     @Volatile private var loading = false
+    /** 页面版本：每次导航或重新编号都会递增，旧编号随之失效。 */
+    private val version = java.util.concurrent.atomic.AtomicLong(0)
+    val pageVersion: Long get() = version.get()
     private val _url = MutableStateFlow("")
     val url: StateFlow<String> = _url.asStateFlow()
     private val _title = MutableStateFlow("")
@@ -48,7 +51,7 @@ object AgentBrowser {
         settings.setSupportMultipleWindows(false)
         CookieManager.getInstance().setAcceptCookie(true)
         webViewClient = object : WebViewClient() {
-            override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) { loading = true; _url.value = url }
+            override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) { loading = true; version.incrementAndGet(); _url.value = url }
             override fun onPageFinished(view: WebView, url: String) { loading = false; _url.value = url; _title.value = view.title.orEmpty() }
             // 只在本浏览器内打开 http(s)，其他协议（拉起应用等）一律不跳转。
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean =
@@ -91,10 +94,12 @@ object AgentBrowser {
         waitForLoad(20_000)
     }
 
-    /** 页面标题、地址、正文和带编号的可交互元素。 */
+    /** 页面标题、地址、正文和带编号的可交互元素；返回的 version 是这批编号对应的页面版本。 */
     suspend fun read(maxChars: Int): JSONObject {
         val raw = script(READ_JS.replace("__MAX__", maxChars.toString()))
-        return runCatching { JSONObject(raw) }.getOrElse { error("页面脚本没有返回内容，可能还在加载") }
+        val page = runCatching { JSONObject(raw) }.getOrElse { error("页面脚本没有返回内容，可能还在加载") }
+        // 脚本重新分配了编号，之前读到的编号不再可靠。
+        return page.put("version", version.incrementAndGet())
     }
 
     suspend fun click(index: Int): String {
@@ -122,6 +127,7 @@ object AgentBrowser {
     }
 
     fun close() {
+        version.incrementAndGet()
         webView?.apply { detachFromParent(); stopLoading(); loadUrl("about:blank"); clearHistory() }
         _url.value = ""
         _title.value = ""
@@ -135,12 +141,21 @@ var els=document.querySelectorAll(sel);
 for(var k=0;k<els.length&&n<150;k++){var e=els[k];var r=e.getBoundingClientRect();var st=window.getComputedStyle(e);
 if(r.width<2||r.height<2||st.visibility=='hidden'||st.display=='none')continue;
 n++;e.setAttribute('data-actonsay',n);
-var label=(e.innerText||e.value||e.getAttribute('aria-label')||e.getAttribute('placeholder')||e.getAttribute('title')||e.getAttribute('alt')||'').trim().replace(/\s+/g,' ').slice(0,80);
+// 输入内容不作为元素标签回传，避免密码、验证码或用户手动填写的私密内容进入模型与日志。
+var editable=/^(INPUT|TEXTAREA|SELECT)$/.test(e.tagName)||e.isContentEditable||e.getAttribute('role')=='textbox';
+var label=((editable?'':e.innerText)||e.getAttribute('aria-label')||e.getAttribute('placeholder')||e.getAttribute('title')||e.getAttribute('alt')||'').trim().replace(/\s+/g,' ').slice(0,80);
 var tag=e.tagName.toLowerCase();if(tag=='input')tag+='['+(e.type||'text')+']';
 var href=e.getAttribute('href');
 items.push(n+'|'+tag+'|'+label+(href&&href.indexOf('javascript')!=0?'|'+e.href.slice(0,150):''));}
-var text=document.body?document.body.innerText.replace(/\n{3,}/g,'\n\n'):'';
-return JSON.stringify({title:document.title,url:location.href,text:text.slice(0,maxChars),text_length:text.length,elements:items});
+// 正文同样跳过可编辑区域，不从 textarea 默认值或富文本编辑器旁路回传输入内容。
+var chunks=[],length=0,visited=0;
+if(document.body){var walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT),node;
+while((node=walker.nextNode())&&length<=maxChars&&visited++<30000){var p=node.parentElement;
+if(!p||p.closest('input,textarea,select,[contenteditable],[role="textbox"],script,style,noscript')||!p.getClientRects().length)continue;
+var css=window.getComputedStyle(p);if(css.visibility=='hidden'||css.display=='none')continue;
+var value=node.nodeValue.replace(/\s+/g,' ').trim();if(value){value=value.slice(0,maxChars+1-length);chunks.push(value);length+=value.length+1;}}}
+var text=chunks.join('\n');if(visited>=30000&&text.length<=maxChars)length=maxChars+1;
+return JSON.stringify({title:document.title,url:location.href,text:text.slice(0,maxChars),text_length:Math.max(length,text.length),elements:items});
 })(__MAX__)"""
 
     private const val TYPE_JS = """(function(i,t,submit){var e=document.querySelector('[data-actonsay="'+i+'"]');if(!e)return 'missing';

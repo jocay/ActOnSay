@@ -7,6 +7,7 @@ import com.voice.actonsay.agent.schemaObject
 import com.voice.actonsay.agent.schemaProp
 import com.voice.actonsay.asr.AsrManager
 import com.voice.actonsay.tasks.TaskRecord
+import com.voice.actonsay.tasks.TaskRepository
 import com.voice.actonsay.tasks.TaskRuntime
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -38,7 +39,9 @@ class StartBackgroundTaskTool : AgentTool {
         }
         // 任务 ID 由调用 ID 派生，回合恢复重放本调用时不会重复创建。
         val id = UUID.nameUUIDFromBytes("background:${ctx.taskId}:${ctx.callId}".toByteArray(Charsets.UTF_8)).toString()
-        val created = TaskRuntime.submit(goal, source = "background", fixedId = id)
+        // 后台任务的结果气泡回到发起它的会话。
+        val created = TaskRuntime.submit(goal, conversationId = current?.conversationId ?: TaskRepository.DEFAULT_CONVERSATION,
+            source = "background", fixedId = id)
         return ToolResult.success("后台任务已创建：$created。告诉用户已开始，完成后会收到通知；不要声称任务已经完成。",
             JSONObject().put("task_id", created))
     }
@@ -51,7 +54,7 @@ class ListTasksTool : AgentTool {
         "only_active" to schemaProp("boolean", "只返回未结束的任务，默认 false", default = false)
     )
     override suspend fun execute(args: JSONObject, ctx: ToolContext): ToolResult {
-        val active = setOf("QUEUED", "RUNNING", "WAITING_APP", "WAITING_CONFIRMATION", "RESULT_UNKNOWN")
+        val active = setOf("QUEUED", "RUNNING", "WAITING_APP", "WAITING_CONFIRMATION", "RESULT_UNKNOWN", "CANCELLING")
         val rows = TaskRuntime.tasks.value.filter { it.visible && it.id != ctx.taskId }
             .filter { !args.optBoolean("only_active") || it.state in active }.take(15)
         if (rows.isEmpty()) return ToolResult.success("没有符合条件的后台任务")
@@ -83,8 +86,9 @@ class CancelTaskTool : AgentTool {
         if (task.state in setOf("SUCCEEDED", "FAILED", "CANCELLED")) {
             return ToolResult.success("任务已经结束，状态 ${task.state}，无需取消")
         }
+        if (task.state == "CANCELLING") return ToolResult.success("任务已在取消中，正在等待执行环境确认停止")
         TaskRuntime.cancel(id)
-        return ToolResult.success("已请求取消任务 $id")
+        return ToolResult.success("已请求取消任务 $id；涉及 Debian 或 MCP 执行时，需执行环境确认停止后才显示为已取消")
     }
 }
 

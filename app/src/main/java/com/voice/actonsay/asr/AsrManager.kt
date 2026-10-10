@@ -12,14 +12,22 @@ import com.voice.actonsay.agent.AgentRunner
 import com.voice.actonsay.agent.DeviceHardening
 import com.voice.actonsay.agent.RootShell
 import com.voice.actonsay.ai.ChatTurn
+import com.voice.actonsay.ai.AiApiFormat
+import com.voice.actonsay.ai.AiProvider
+import com.voice.actonsay.ai.ProviderPreset
 import com.voice.actonsay.ai.FastDecisionClient
 import com.voice.actonsay.ai.OverlapDecision
 import com.voice.actonsay.ai.OpenAiClient
 import com.voice.actonsay.bridge.BridgeClient
 import com.voice.actonsay.config.SettingsRepository
+import com.voice.actonsay.diagnostics.Diagnostics
+import com.voice.actonsay.tasks.ConversationRecord
 import com.voice.actonsay.tasks.CredentialRedactor
+import com.voice.actonsay.tasks.MessageSearchHit
+import com.voice.actonsay.tasks.TaskRecord
 import com.voice.actonsay.tasks.TaskRepository
 import com.voice.actonsay.tasks.TaskRuntime
+import com.voice.actonsay.tasks.TaskStates
 import com.voice.actonsay.tts.MimoTtsClient
 import com.voice.actonsay.tts.TtsEngineType
 import com.voice.actonsay.tts.TtsManager
@@ -84,6 +92,9 @@ data class AsrState(
     val aiBaseUrl: String = "https://api.deepseek.com/v1",
     val aiApiKey: String = "",
     val aiModel: String = "deepseek-chat",
+    val aiProviders: List<AiProvider> = emptyList(),
+    val aiProviderId: String = "",
+    val aiApiFormat: AiApiFormat = AiApiFormat.CHAT_COMPLETIONS,
     val aiSystemPrompt: String = AsrManager.DEFAULT_SYSTEM_PROMPT,
     val aiStreaming: Boolean = true,
     val aiContextTurns: Int = 6,
@@ -148,10 +159,17 @@ data class AsrState(
 
     // 统计
     val totalWakeCount: Int = 0,
-    val totalTurnCount: Int = 0
+    val totalTurnCount: Int = 0,
+
+    /** 唤醒词与 VAD 模型已在后台加载完成；未就绪时文字对话照常可用。 */
+    val voiceReady: Boolean = false,
+    /** 当前显示的会话。 */
+    val conversationId: String = TaskRepository.DEFAULT_CONVERSATION,
+    /** 用户主动开启的耗时与失败诊断记录。 */
+    val diagnosticsEnabled: Boolean = false
 ) {
     /** 语音链路是否已具备 AI 回复条件。 */
-    val aiReady: Boolean get() = aiEnabled && aiBaseUrl.isNotBlank() && aiApiKey.isNotBlank()
+    val aiReady: Boolean get() = aiEnabled && aiBaseUrl.isNotBlank() && aiModel.isNotBlank()
     val asrReady: Boolean get() = apiKey.isNotBlank()
 }
 
@@ -166,7 +184,7 @@ object AsrManager {
     const val MANUAL_INPUT_WORD = "文字输入"
     const val MAX_MESSAGES = 300
 
-    val DEFAULT_WAKE_WORDS = setOf("你好小智", "小爱同学")
+    val DEFAULT_WAKE_WORDS = setOf("你好墨宝")
     val DEFAULT_INTERRUPT_WORDS = setOf("等一下")
     const val FOLLOW_UP_WORD = "连续对话"
     const val INTERRUPT_SOURCE = "语音打断"
@@ -200,6 +218,7 @@ object AsrManager {
     private const val KEY_KEEP_SCREEN_ON = "keep_screen_on"
     private const val KEY_WAKE_COUNT = "stat_wake_count"
     private const val KEY_TURN_COUNT = "stat_turn_count"
+    private const val KEY_CONVERSATION = "current_conversation"
 
     private const val EVENTS_FILE = "keyword_events.json"
 
@@ -217,7 +236,15 @@ object AsrManager {
     private val kwsManager = KwsManager()
     private val volcClient = VolcengineStreamAsrClient()
     private var vad: Vad? = null
-    private var pendingVadSamples = FloatArray(0)
+    /** VAD 窗口缓冲：录音帧逐段拷入，凑满一个窗口送一次，不再每帧拼接新数组。 */
+    private val vadWindow = FloatArray(VAD_WINDOW_SIZE)
+    private var vadFill = 0
+    @Volatile private var voiceReady = false
+    private var voicePreparing = false
+
+    private val _conversations = MutableStateFlow<List<ConversationRecord>>(emptyList())
+    /** 会话列表，按最近更新排序。 */
+    val conversations: StateFlow<List<ConversationRecord>> = _conversations.asStateFlow()
 
     val keywordDetector = KeywordDetector()
 
@@ -243,36 +270,19 @@ object AsrManager {
     @Volatile private var ackPlaying = false
     @Volatile private var listenResumeAt = 0L
     private var ackToken = 0
+    @Volatile private var recognitionGeneration = 0L
 
-    /** 当前前台回合的流式朗读进度：回复边生成边按句入队，不等全文结束。 */
-    private class SpeechStream(val taskId: String, val voice: Boolean) {
-        var consumed = 0
-        var lastAnswer = ""
-        var spokenChars = 0
-        var muted = false
-        var inCode = false
-        /** 用户打断或开始新一轮；与朗读预算用尽的 [muted] 区分，打断后不进入连续对话。 */
-        var interrupted = false
-        var promotedAnnounced = false
-        var lastSpokenAt = System.currentTimeMillis()
+    private val speech by lazy {
+        SpeechCoordinator(_state, scope, ::returnToStandby) {
+            onWakeWordDetected(FOLLOW_UP_WORD, manual = true, ack = false, timeoutMs = 5000L)
+        }
     }
-    private var speechStream: SpeechStream? = null
-    /** 语音回合的回答已全部入队，播完后进入连续对话。 */
-    private var followUpPending = false
-    private var narrationJob: Job? = null
     /** 有前台回合在执行；录音线程据此决定是否监听打断词，避免每帧扫描任务列表。 */
     @Volatile private var foregroundBusy = false
-    private val announcedTasks = mutableSetOf<String>()
-    private val taskStates = mutableMapOf<String, String>()
-    private val pendingAnnouncements = ArrayDeque<String>()
+    private val STOP_SPEAKING_PHRASES = setOf("别说了", "不要说了", "别念了", "不用念了", "不要念了", "停止朗读", "停止播报", "闭嘴", "安静", "安静点")
+    private val STOP_TASK_PHRASES = setOf("停", "停止", "停下", "停下来", "停止任务", "取消任务", "取消", "别做了", "不用做了", "不要做了", "算了", "停止执行")
     private const val VOICE_TURN_HINT = "\n本条消息来自语音，回答会被完整朗读：用口语化的句子先直接给出结论，" +
         "除非用户要求详细否则保持简短，不要使用表格、代码块和长列表。"
-    private const val SPEECH_BUDGET_CHARS = 160
-    private const val SPEECH_CHUNK_CHARS = 30
-    private const val FOLLOW_UP_TIMEOUT_MS = 5000L
-    private const val NARRATION_SILENCE_MS = 8000L
-    private const val NARRATION_REPEAT_MS = 20000L
-
     @Synchronized
     fun initControlPlane(context: Context) {
         TtsManager.init(context)
@@ -281,6 +291,11 @@ object AsrManager {
             credentialError = ""
             val repository = SettingsRepository(context)
             settingsRepository = repository
+            scope.launch {
+                repository.saveError.collect { error ->
+                    if (error.isNotBlank()) _state.value = _state.value.copy(errorMessage = error)
+                }
+            }
             val p = repository.preferences
             prefs = p
             appContext = context.applicationContext
@@ -358,8 +373,13 @@ object AsrManager {
                 keepScreenOn = p.getBoolean(KEY_KEEP_SCREEN_ON, false),
                 totalWakeCount = p.getInt(KEY_WAKE_COUNT, 0),
                 totalTurnCount = p.getInt(KEY_TURN_COUNT, 0),
+                conversationId = p.getString(KEY_CONVERSATION, TaskRepository.DEFAULT_CONVERSATION).orEmpty()
+                    .ifBlank { TaskRepository.DEFAULT_CONVERSATION },
+                diagnosticsEnabled = p.getBoolean("diagnostics_enabled", false),
                 errorMessage = credentialError
             )
+            loadAiProviders()
+            Diagnostics.enabled = _state.value.diagnosticsEnabled
 
             TaskRepository.init(context)
             TaskRuntime.init(context) { agentConfig() }
@@ -371,31 +391,41 @@ object AsrManager {
 
     }
 
+    /** 界面和服务都调用；控制面同步就绪，唤醒词与 VAD 模型在后台加载，不阻塞首屏。 */
     @Synchronized
     fun init(context: Context) {
         initControlPlane(context)
 
         AgentRunner.init(context)
         refreshRootStatus()
-
-        kwsManager.init(context.assets)
-        kwsManager.updateWakeWords(_state.value.customWakeWords)
-        kwsManager.updateInterruptWords(_state.value.interruptWords)
-
-        if (vad == null) {
-            val vadConfig = VadModelConfig(
-                sileroVadModelConfig = SileroVadModelConfig(
-                    model = "silero_vad.onnx",
-                    threshold = 0.5f,
-                    minSilenceDuration = 0.25f,
-                    minSpeechDuration = 0.25f,
-                    windowSize = VAD_WINDOW_SIZE,
-                ),
-                sampleRate = SAMPLE_RATE,
-                numThreads = 1,
-            )
-            vad = Vad(assetManager = context.assets, config = vadConfig)
-            Log.i(TAG, "Silero VAD initialized")
+        if (voiceReady || voicePreparing) return
+        voicePreparing = true
+        val assets = context.applicationContext.assets
+        scope.launch(Dispatchers.Default) {
+            val started = System.currentTimeMillis()
+            kwsManager.init(assets)
+            kwsManager.updateWakeWords(_state.value.customWakeWords)
+            kwsManager.updateInterruptWords(_state.value.interruptWords)
+            val created = runCatching {
+                Vad(assetManager = assets, config = VadModelConfig(
+                    sileroVadModelConfig = SileroVadModelConfig(
+                        model = "silero_vad.onnx",
+                        threshold = 0.5f,
+                        minSilenceDuration = 0.25f,
+                        minSpeechDuration = 0.25f,
+                        windowSize = VAD_WINDOW_SIZE,
+                    ),
+                    sampleRate = SAMPLE_RATE,
+                    numThreads = 1,
+                ))
+            }.onFailure { Log.e(TAG, "Failed to initialize Silero VAD", it) }.getOrNull()
+            synchronized(this@AsrManager) {
+                vad = created
+                voiceReady = true
+                voicePreparing = false
+            }
+            Log.i(TAG, "Voice models ready in ${System.currentTimeMillis() - started} ms")
+            withContext(Dispatchers.Main) { _state.value = _state.value.copy(voiceReady = true) }
         }
     }
 
@@ -405,9 +435,11 @@ object AsrManager {
 
     private fun loadPersistedData() {
         val dir = filesDir ?: return
+        scope.launch { TaskRepository.observeConversations().collect { _conversations.value = it } }
         scope.launch {
+            val conversation = _state.value.conversationId
             val loaded = withContext(Dispatchers.IO) {
-                val messages = runCatching { TaskRepository.loadMessages() }
+                val messages = runCatching { TaskRepository.loadMessages(conversation) }
                     .onFailure { Log.w(TAG, "Failed to load chat history", it) }
                     .getOrDefault(emptyList())
                 val events = runCatching { readEvents(File(dir, EVENTS_FILE)) }
@@ -415,7 +447,7 @@ object AsrManager {
                     .getOrDefault(emptyList())
                 messages to events
             }
-            if (loaded.first.isNotEmpty()) {
+            if (loaded.first.isNotEmpty() && _state.value.conversationId == conversation) {
                 // 仅在期间没有产生新消息时合并历史，避免覆盖用户刚发出的消息
                 _state.value = _state.value.copy(messages = (loaded.first + _state.value.messages).associateBy { it.id }.values.toList().takeLast(MAX_MESSAGES))
             }
@@ -464,17 +496,83 @@ object AsrManager {
 
     /** 防抖落盘对话历史。 */
     private fun scheduleSaveHistory() {
-        val dir = filesDir ?: return
+        if (filesDir == null) return
         saveHistoryJob?.cancel()
         saveHistoryJob = scope.launch {
             delay(400)
-            val snapshot = _state.value.messages
-            withContext(Dispatchers.IO) {
-                runCatching { TaskRepository.saveMessages(snapshot) }
-                    .onFailure { Log.w(TAG, "Failed to save chat history", it) }
-            }
+            saveNow(_state.value.messages, _state.value.conversationId)
         }
     }
+
+    private suspend fun saveNow(messages: List<ChatMessage>, conversationId: String) {
+        withContext(Dispatchers.IO) {
+            runCatching { TaskRepository.saveMessages(messages, conversationId) }
+                .onFailure { Log.w(TAG, "Failed to save chat history", it) }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 多会话
+    // ---------------------------------------------------------------------
+
+    /** 新建并切换到一个空会话；当前会话为空时直接复用。 */
+    fun newConversation() {
+        if (_state.value.messages.isEmpty()) return
+        scope.launch {
+            val id = TaskRepository.createConversation()
+            openConversation(id)
+        }
+    }
+
+    fun switchConversation(id: String) {
+        if (id == _state.value.conversationId) return
+        scope.launch { openConversation(id) }
+    }
+
+    /** 先把当前会话未落盘的改动写入，再载入目标会话；空会话离开时删除，避免列表里堆积空白项。 */
+    private suspend fun openConversation(id: String) {
+        val previous = _state.value.conversationId
+        val previousMessages = _state.value.messages
+        saveHistoryJob?.cancel()
+        if (previousMessages.isEmpty()) runCatching { TaskRepository.deleteConversation(previous) }
+        else saveNow(previousMessages, previous)
+        val messages = runCatching { TaskRepository.loadMessages(id) }.getOrDefault(emptyList())
+        prefs?.edit()?.putString(KEY_CONVERSATION, id)?.apply()
+        _state.value = _state.value.copy(conversationId = id, messages = messages.takeLast(MAX_MESSAGES))
+        // 载入的回复可能停在“加载中”：按任务的最新状态补齐。
+        applyTasks(TaskRuntime.tasks.value)
+    }
+
+    /** 删除会话；删除的是当前会话时切到最近的其他会话或新建一个。 */
+    fun deleteConversation(id: String) {
+        scope.launch {
+            if (id == _state.value.conversationId) {
+                saveHistoryJob?.cancel()
+                _state.value = _state.value.copy(messages = emptyList())
+                val next = _conversations.value.firstOrNull { it.id != id }?.id ?: TaskRepository.createConversation()
+                openConversation(next)
+            }
+            runCatching { TaskRepository.deleteConversation(id) }
+        }
+    }
+
+    /** 清空所有会话及消息（关于与数据页）。 */
+    fun clearAllConversations() {
+        scope.launch {
+            saveHistoryJob?.cancel()
+            runCatching { TaskRepository.deleteAllConversations() }
+            prefs?.edit()?.putString(KEY_CONVERSATION, TaskRepository.DEFAULT_CONVERSATION)?.apply()
+            _state.value = _state.value.copy(conversationId = TaskRepository.DEFAULT_CONVERSATION, messages = emptyList())
+        }
+    }
+
+    suspend fun searchMessages(query: String): List<MessageSearchHit> = runCatching { TaskRepository.search(query) }.getOrDefault(emptyList())
+
+    /** 当前会话中尚未结束的前台回合（执行中或排队），用于展示可取消的队列。 */
+    fun pendingTurns(tasks: List<TaskRecord>): List<TaskRecord> = tasks.filter {
+        it.source in TaskRuntime.FOREGROUND_SOURCES && !it.visible && it.conversationId == _state.value.conversationId &&
+            it.state in setOf(TaskStates.QUEUED, TaskStates.RUNNING, TaskStates.WAITING_CONFIRMATION)
+    }.sortedBy { it.createdAt }
 
     private fun updateMessages(transform: (List<ChatMessage>) -> List<ChatMessage>) {
         val updated = transform(_state.value.messages).takeLast(MAX_MESSAGES)
@@ -500,13 +598,13 @@ object AsrManager {
         return AgentConfig(st.aiBaseUrl, st.aiApiKey, st.aiModel,
             AgentPrompt.build(st.aiSystemPrompt, st.hasRoot) + memory,
             st.aiStreaming, maxSteps = st.taskMaxSteps, maxTaskSeconds = st.taskTimeoutMinutes * 60,
-            supportsImages = st.aiVisionEnabled)
+            supportsImages = st.aiVisionEnabled, apiFormat = st.aiApiFormat)
     }
 
     @Synchronized
     fun setBridgeConfig(baseUrl: String, token: String) {
         val normalized = BridgeClient.validateBaseUrl(baseUrl)
-        settingsRepository?.putSecret("bridge_token", token.trim())
+        settingsRepository?.queueSecret("bridge_token", token.trim())
         prefs?.edit()?.putString("bridge_base_url", normalized)?.apply()
         _state.value = _state.value.copy(bridgeBaseUrl = normalized, bridgeToken = token.trim())
     }
@@ -516,6 +614,14 @@ object AsrManager {
         require(name.matches(Regex("[A-Za-z0-9_.-]{1,64}"))) { "无效的容器名称" }
         prefs?.edit()?.putString("bridge_container", name)?.apply()
         _state.value = _state.value.copy(bridgeContainer = name)
+    }
+
+    suspend fun setPairedBridgeConfig(container: String, baseUrl: String, token: String) {
+        withContext(Dispatchers.IO) { settingsRepository?.persistSecret("bridge_token", token.trim()) }
+        withContext(Dispatchers.Main) {
+            setBridgeContainer(container)
+            setBridgeConfig(baseUrl, token)
+        }
     }
 
     @Synchronized
@@ -563,7 +669,7 @@ object AsrManager {
 
     @Synchronized
     fun setMusic(apiKey: String, quality: String) {
-        settingsRepository?.putSecret("music_api_key", apiKey.trim())
+        settingsRepository?.queueSecret("music_api_key", apiKey.trim())
         val level = quality.takeIf { it in setOf("standard", "exhigh", "lossless", "hires") } ?: "exhigh"
         prefs?.edit()?.putString("music_quality", level)?.apply()
         _state.value = _state.value.copy(musicApiKey = apiKey.trim(), musicQuality = level)
@@ -586,8 +692,8 @@ object AsrManager {
     fun setWebAccess(proxy: String, braveKey: String, exaKey: String, provider: String) {
         val normalized = proxy.trim().removePrefix("http://").trimEnd('/')
         require(normalized.isEmpty() || Regex("[A-Za-z0-9.-]{1,253}:\\d{1,5}").matches(normalized)) { "代理格式应为 主机:端口" }
-        settingsRepository?.putSecret("brave_api_key", braveKey.trim())
-        settingsRepository?.putSecret("exa_api_key", exaKey.trim())
+        settingsRepository?.queueSecret("brave_api_key", braveKey.trim())
+        settingsRepository?.queueSecret("exa_api_key", exaKey.trim())
         val choice = provider.takeIf { it in setOf("auto", "brave", "exa") } ?: "auto"
         prefs?.edit()?.putString("web_proxy", normalized)?.putString("search_provider", choice)?.apply()
         _state.value = _state.value.copy(webProxy = normalized, braveApiKey = braveKey.trim(), exaApiKey = exaKey.trim(), searchProvider = choice)
@@ -601,7 +707,7 @@ object AsrManager {
 
     @Synchronized
     fun setFastDecision(enabled: Boolean, apiKey: String) {
-        settingsRepository?.putSecret("fast_decision_api_key", apiKey.trim())
+        settingsRepository?.queueSecret("fast_decision_api_key", apiKey.trim())
         prefs?.edit()?.putBoolean("fast_decision_enabled", enabled)?.apply()
         _state.value = _state.value.copy(fastDecisionEnabled = enabled, fastDecisionApiKey = apiKey.trim())
     }
@@ -623,7 +729,7 @@ object AsrManager {
             JSONObject().put("name", "configuration_probe").put("description", "用于配置检查的虚拟函数")
                 .put("parameters", JSONObject().put("type", "object").put("properties", JSONObject()))))
         val response = OpenAiClient.complete(st.aiBaseUrl, st.aiApiKey, st.aiModel,
-            OpenAiClient.buildMessages("请调用 configuration_probe 一次，用于验证工具调用协议。", emptyList(), "检查工具调用能力"), tools, false, null).getOrThrow()
+            OpenAiClient.buildMessages("请调用 configuration_probe 一次，用于验证工具调用协议。", emptyList(), "检查工具调用能力"), tools, false, null, st.aiApiFormat).getOrThrow()
         return JSONObject().put("supported", response.toolCalls.any { it.name == "configuration_probe" })
             .put("model", st.aiModel).put("detail", if (response.hasToolCalls) "模型返回了工具调用" else "模型未返回工具调用，请检查模型与接口设置")
     }
@@ -658,209 +764,54 @@ object AsrManager {
         if (taskObserver != null) return
         taskObserver = scope.launch {
             TaskRuntime.tasks.collect { tasks ->
-                val byId = tasks.associateBy { it.id }
                 foregroundBusy = TaskRuntime.activeForegroundTurn() != null
-                announceFinishedTasks(tasks)
+                speech.observe(tasks)
                 // 模型在本次运行期间创建的后台任务在对话里有自己的气泡，结果回到对话；用户删除后不再补发。
+                // 气泡放进创建它的会话：不在当前会话时直接写入那个会话的记录。
                 val fresh = tasks.filter { it.source == "background" && it.createdAt >= processStartedAt && bubbleTaskIds.add(it.id) }
                     .filter { task -> _state.value.messages.none { it.taskId == task.id } }.sortedBy { it.createdAt }
-                if (fresh.isNotEmpty()) updateMessages { list ->
-                    list + fresh.map { ChatMessage(role = "assistant", content = "", isLoading = true, taskId = it.id) }
+                val (here, elsewhere) = fresh.partition { it.conversationId == _state.value.conversationId }
+                if (here.isNotEmpty()) updateMessages { list ->
+                    list + here.map { ChatMessage(role = "assistant", content = "", isLoading = true, taskId = it.id) }
                 }
-                val previouslyLoading = _state.value.messages.filter { it.isLoading && it.taskId.isNotBlank() }
-                updateMessages { list -> list.map { msg ->
-                    val task = byId[msg.taskId] ?: return@map msg
-                    val terminal = task.state in setOf("SUCCEEDED", "FAILED", "CANCELLED")
-                    // 普通回合思考时只显示输入动画，有实际工具进度才显示文字。
-                    val quiet = task.progress.isBlank() || task.progress == "任务开始" || task.progress.startsWith("思考")
-                    msg.copy(content = when {
-                        task.state == "FAILED" -> (if (task.visible) "任务失败：" else "出错了：") + task.error
-                        task.state == "CANCELLED" -> "已取消"
-                        task.state == "RESULT_UNKNOWN" -> "结果待确认：${task.error}"
-                        task.state == "WAITING_CONFIRMATION" -> "需要你的授权才能继续，请在下方确认本次工具操作。"
-                        task.state == "WAITING_APP" -> "等待应用恢复：${task.error}"
-                        task.answer.isNotBlank() -> task.answer
-                        task.visible -> if (quiet) "后台任务执行中…" else task.progress
-                        quiet -> ""
-                        else -> task.progress
-                    }, isLoading = !terminal && task.state !in setOf("RESULT_UNKNOWN", "WAITING_CONFIRMATION", "WAITING_APP"),
-                        isError = task.state in setOf("FAILED", "RESULT_UNKNOWN"))
-                } }
-                if (previouslyLoading.any { it.taskId == foregroundTaskId && byId[it.taskId]?.state in setOf("SUCCEEDED", "FAILED", "CANCELLED") }) {
-                    foregroundTaskId = null
+                elsewhere.forEach { task ->
+                    launch { runCatching { TaskRepository.appendMessage(task.conversationId,
+                        ChatMessage(role = "assistant", content = "", isLoading = true, taskId = task.id)) } }
                 }
-                speechStream?.let { stream -> byId[stream.taskId]?.let { feedSpeech(stream, it) } }
+                applyTasks(tasks)
             }
         }
     }
 
-    /**
-     * 把回合已生成的文本切成短段送入朗读队列，回复还在生成时就开始播报。
-     * 首段取第一个分句以尽快出声，之后每段约 [SPEECH_CHUNK_CHARS] 字并在标点处断开；各段并行合成、顺序播放。
-     */
-    private fun feedSpeech(stream: SpeechStream, task: com.voice.actonsay.tasks.TaskRecord) {
-        val finished = task.state == "SUCCEEDED"
-        if (task.state != "RUNNING" && task.state != "QUEUED" && !finished) { speechStream = null; return }
-        // 转入后台时告诉用户一声，之后这一轮不再朗读，完成时由后台通报负责。
-        if (task.visible && stream.voice && !stream.promotedAnnounced && !stream.interrupted && _state.value.ttsEnabled) {
-            stream.promotedAnnounced = true
-            stream.muted = true
-            say("这件事要多花点时间，我转到后台继续，完成后告诉你。")
-        }
-        // 被打断或预算用尽后只等待回合结束。
-        if (stream.muted || task.visible || !_state.value.ttsEnabled) { if (finished) speechStream = null; return }
-        val answer = task.answer
-        // 工具调用前后的每一轮生成都从头累计文本；前缀不再匹配说明进入了新一轮。
-        if (!answer.startsWith(stream.lastAnswer.take(stream.consumed))) { stream.consumed = 0; stream.inCode = false }
-        stream.lastAnswer = answer
-        val budget = if (_state.value.ttsFullReply) Int.MAX_VALUE else SPEECH_BUDGET_CHARS
-        while (!stream.muted) {
-            val pending = answer.substring(stream.consumed)
-            val first = stream.spokenChars == 0
-            val minimum = if (first) 5 else 12
-            // 句末标点优先；首段连逗号也算，让第一声尽早出来。
-            var cut = pending.indexOfFirstFrom(minimum - 1) { it in "。！？!?\n；" || (first && it in "，,：:") } + 1
-            if (cut <= 0 || cut > SPEECH_CHUNK_CHARS + 10) {
-                cut = when {
-                    pending.length >= SPEECH_CHUNK_CHARS -> pending.take(SPEECH_CHUNK_CHARS + 10).indexOfLast { it in "，,、：:；。！？!? \n" }.let { if (it >= minimum - 1) it + 1 else SPEECH_CHUNK_CHARS }
-                    finished && pending.isNotEmpty() -> pending.length
-                    else -> 0
-                }
-            }
-            if (cut <= 0) break
-            val raw = pending.take(cut)
-            stream.consumed += cut
-            // 代码块整体跳过：围栏成对出现，奇数个说明进入或离开了代码块。
-            val fences = Regex("```").findAll(raw).count()
-            val wasInCode = stream.inCode
-            if (fences % 2 == 1) stream.inCode = !stream.inCode
-            if (wasInCode || fences > 0) continue
-            val chunk = speakable(raw)
-            if (chunk.isBlank()) continue
-            val remaining = budget - stream.spokenChars
-            val text = if (chunk.length <= remaining) chunk else {
-                stream.muted = true
-                chunk.take(remaining).let { head -> head.take(head.indexOfLast { it in "。！？!?；，," } + 1).ifBlank { head } }
-            }
-            if (text.isBlank()) break
-            stream.spokenChars += text.length
-            if (!say(text)) stream.muted = true
-        }
-        if (finished) {
-            speechStream = null
-            narrationJob?.cancel()
-            // 语音提问的回答播完后接着听，不用再喊唤醒词；回答若已提前播完，立即进入。
-            if (stream.voice && !stream.interrupted && stream.spokenChars > 0) {
-                followUpPending = true
-                if (!TtsManager.isSpeaking.value) onSpeechIdle()
-            }
+    /** 把任务的最新状态映射到当前会话的回复气泡。 */
+    private fun applyTasks(tasks: List<TaskRecord>) {
+        val byId = tasks.associateBy { it.id }
+        val busyTurn = tasks.any { it.source in TaskRuntime.FOREGROUND_SOURCES && !it.visible && it.state == TaskStates.RUNNING }
+        val previouslyLoading = _state.value.messages.filter { it.isLoading && it.taskId.isNotBlank() }
+        updateMessages { list -> list.map { msg ->
+            val task = byId[msg.taskId] ?: return@map msg
+            val terminal = task.state in setOf("SUCCEEDED", "FAILED", "CANCELLED")
+            // 普通回合思考时只显示输入动画，有实际工具进度才显示文字。
+            val quiet = task.progress.isBlank() || task.progress == "任务开始" || task.progress.startsWith("思考")
+            msg.copy(content = when {
+                task.state == "FAILED" -> (if (task.visible) "任务失败：" else "出错了：") + task.error
+                task.state == "CANCELLED" -> "已取消"
+                task.state == TaskStates.CANCELLING -> "正在取消，等待执行环境确认停止…" + if (task.error.isNotBlank()) "\n${task.error}" else ""
+                task.state == "RESULT_UNKNOWN" -> "结果待确认：${task.error}"
+                task.state == "WAITING_CONFIRMATION" -> "需要你的授权才能继续，请在下方确认本次工具操作。"
+                task.state == "WAITING_APP" -> "等待应用恢复：${task.error}"
+                task.answer.isNotBlank() -> task.answer
+                task.state == TaskStates.QUEUED && !task.visible && busyTurn -> "排队中，等上一条处理完…"
+                task.visible -> if (quiet) "后台任务执行中…" else task.progress
+                quiet -> ""
+                else -> task.progress
+            }, isLoading = !terminal && task.state !in setOf("RESULT_UNKNOWN", "WAITING_CONFIRMATION", "WAITING_APP", TaskStates.CANCELLING),
+                isError = task.state in setOf("FAILED", "RESULT_UNKNOWN"))
+        } }
+        if (previouslyLoading.any { it.taskId == foregroundTaskId && byId[it.taskId]?.state in setOf("SUCCEEDED", "FAILED", "CANCELLED") }) {
+            foregroundTaskId = null
         }
     }
-
-    /**
-     * 后台任务、定时任务在本次运行中由未完成变为完成时语音通报一句；定时任务直接念出结果（多为提醒）。
-     * 正在对话时先排队，回到待机后再播。
-     */
-    private fun announceFinishedTasks(tasks: List<com.voice.actonsay.tasks.TaskRecord>) {
-        for (task in tasks) {
-            val previous = taskStates.put(task.id, task.state)
-            if (!task.visible || previous == null || previous == task.state) continue
-            if (task.state !in setOf("SUCCEEDED", "FAILED") || !announcedTasks.add(task.id)) continue
-            if (!_state.value.announceBackground || !_state.value.ttsEnabled) continue
-            val goal = speakable(task.goal).take(24)
-            val text = when {
-                task.source == "automation" && task.state == "SUCCEEDED" -> speakable(task.answer).take(SPEECH_BUDGET_CHARS).ifBlank { "定时任务完成了：$goal" }
-                task.state == "SUCCEEDED" -> "后台任务完成了：$goal。结果在任务页。"
-                else -> "后台任务没有完成：$goal。"
-            }
-            pendingAnnouncements.addLast(text)
-        }
-        flushAnnouncements()
-    }
-
-    /** 把一段话放进朗读队列；用户正在说话或识别中时不抢话。 */
-    private fun say(text: String): Boolean {
-        val st = _state.value
-        if (st.engineState != EngineState.WAITING_WAKEWORD && st.engineState != EngineState.IDLE && st.engineState != EngineState.SPEAKING_TTS) return false
-        if (st.engineState != EngineState.SPEAKING_TTS) _state.value = st.copy(engineState = EngineState.SPEAKING_TTS)
-        TtsManager.enqueue(text) { scope.launch { onSpeechIdle() } }
-        speechStream?.lastSpokenAt = System.currentTimeMillis()
-        return true
-    }
-
-    /** 朗读队列播完：需要时进入连续对话，否则回到待机并补播积压的后台通报。 */
-    private fun onSpeechIdle() {
-        val st = _state.value
-        val speaking = st.engineState == EngineState.SPEAKING_TTS
-        if (followUpPending && speechStream == null) {
-            followUpPending = false
-            if (st.followUpEnabled && st.isListening && (speaking || st.engineState == EngineState.WAITING_WAKEWORD)) {
-                onWakeWordDetected(FOLLOW_UP_WORD, manual = true, ack = false, timeoutMs = FOLLOW_UP_TIMEOUT_MS)
-                return
-            }
-        }
-        if (speaking) returnToStandby()
-        flushAnnouncements()
-    }
-
-    private fun flushAnnouncements() {
-        if (pendingAnnouncements.isEmpty() || speechStream != null) return
-        val st = _state.value
-        if (st.engineState != EngineState.WAITING_WAKEWORD && st.engineState != EngineState.IDLE) return
-        while (pendingAnnouncements.isNotEmpty()) say(pendingAnnouncements.removeFirst())
-    }
-
-    /** 语音回合较久没出声时，按工具上报的当前步骤播一句进度，让用户知道还在干活。 */
-    private fun startNarration(taskId: String) {
-        narrationJob?.cancel()
-        narrationJob = scope.launch {
-            var lastPhrase = ""
-            var lastNarratedAt = 0L
-            while (true) {
-                delay(1000)
-                val stream = speechStream?.takeIf { it.taskId == taskId } ?: break
-                if (stream.interrupted || stream.muted) break
-                val task = TaskRuntime.tasks.value.firstOrNull { it.id == taskId } ?: continue
-                if (task.visible || task.state !in setOf("QUEUED", "RUNNING")) break
-                val now = System.currentTimeMillis()
-                if (TtsManager.isSpeaking.value || now - stream.lastSpokenAt < NARRATION_SILENCE_MS) continue
-                val phrase = narrationFor(task.progress)
-                // 同一阶段不反复念，除非已经安静了很久。
-                if (phrase == lastPhrase && now - lastNarratedAt < NARRATION_REPEAT_MS) continue
-                if (say(phrase)) { lastPhrase = phrase; lastNarratedAt = now }
-            }
-        }
-    }
-
-    private fun narrationFor(progress: String): String = when {
-        progress.startsWith("搜索") -> "正在搜索，请稍等。"
-        progress.startsWith("读取") -> "正在读取网页。"
-        progress.contains("浏览器") -> "正在浏览网页。"
-        progress.contains("虚拟屏") -> "正在手机上操作。"
-        progress.contains("Debian") -> "正在容器里执行，请稍等。"
-        progress.contains("音乐") || progress.contains("歌") -> "正在找歌。"
-        progress.contains("提醒") || progress.contains("计时") || progress.contains("闹钟") -> "正在设置。"
-        progress.isBlank() || progress == "任务开始" || progress.startsWith("思考") -> "还在想，请稍等。"
-        else -> "还在处理，请稍等。"
-    }
-
-    private inline fun String.indexOfFirstFrom(start: Int, predicate: (Char) -> Boolean): Int {
-        for (index in start.coerceAtLeast(0) until length) if (predicate(this[index])) return index
-        return -1
-    }
-
-    /** 去掉 Markdown 标记、表格和代码块，只留适合朗读的文字。 */
-    private fun speakable(markdown: String): String = markdown.lineSequence()
-        .filterNot { line -> line.trimStart().let { it.startsWith("|") || it.startsWith("```") || it.matches(Regex("[-*_ ]{3,}")) } }
-        .joinToString("\n")
-        .replace(Regex("!?\\[([^\\]]*)]\\([^)]*\\)"), "$1")
-        .replace(Regex("https?://\\S+"), "")
-        .replace(Regex("[`#*_>~]"), "")
-        .replace(Regex("(?m)^\\s*[-+]\\s+"), "")
-        .replace(Regex("(?<![。！？!?；，,：:])\\s*\\n\\s*"), "，")
-        .replace(Regex("\\s*\\n\\s*"), "")
-        .replace(Regex("[，,]{2,}"), "，")
-        .trim().trim('，', ',')
 
     // ---------------------------------------------------------------------
     // 配置写入
@@ -869,7 +820,7 @@ object AsrManager {
     @Synchronized
     fun setApiKey(newKey: String) {
         val trimmed = newKey.trim()
-        settingsRepository?.putSecret(KEY_API_KEY, trimmed)
+        settingsRepository?.queueSecret(KEY_API_KEY, trimmed)
         _state.value = _state.value.copy(apiKey = trimmed, errorMessage = "")
         Log.i(TAG, "Updated Volcengine API Key")
     }
@@ -889,8 +840,15 @@ object AsrManager {
     }
 
     @Synchronized
-    fun setAiEndpoint(baseUrl: String, apiKey: String, model: String) {
-        settingsRepository?.putSecret(KEY_AI_API_KEY, apiKey.trim())
+    fun setAiEndpoint(baseUrl: String, apiKey: String, model: String, format: AiApiFormat = _state.value.aiApiFormat) {
+        val st = _state.value
+        val selected = st.aiProviders.firstOrNull { it.id == st.aiProviderId }
+        if (selected != null) {
+            val updated = selected.copy(baseUrl = baseUrl.trim(), apiKey = apiKey.trim(), model = model.trim(), format = format)
+            saveAiProviders(st.aiProviders.map { if (it.id == selected.id) updated else it }, selected.id)
+            return
+        }
+        settingsRepository?.queueSecret(KEY_AI_API_KEY, apiKey.trim())
         prefs?.edit()?.apply {
             putString(KEY_AI_BASE_URL, baseUrl.trim())
             putString(KEY_AI_MODEL, model.trim())
@@ -898,9 +856,79 @@ object AsrManager {
         _state.value = _state.value.copy(
             aiBaseUrl = baseUrl.trim(),
             aiApiKey = apiKey.trim(),
-            aiModel = model.trim()
+            aiModel = model.trim(), aiApiFormat = format
         )
         Log.i(TAG, "Updated OpenAI endpoint: model=${model.trim()}")
+    }
+
+    /** 从旧单接口配置迁移，密钥继续使用系统 Keystore 加密。 */
+    private fun loadAiProviders() {
+        val st = _state.value
+        val saved = prefs?.getString("ai_providers", null)
+        if (saved == null) {
+            // 首次迁移先确保密钥落盘，再写供应商元数据，避免进程退出丢失旧凭据。
+            runCatching { settingsRepository?.persistSecret("ai_provider_key_legacy", st.aiApiKey) }.getOrElse {
+                _state.value = st.copy(errorMessage = "供应商密钥迁移失败，原有配置已保留。")
+                return
+            }
+        }
+        val providers = if (saved == null) listOf(AiProvider("legacy", "原有供应商", st.aiBaseUrl, st.aiModel, apiKey = st.aiApiKey)) else runCatching {
+            val rows = JSONArray(saved)
+            List(rows.length()) { index ->
+                val row = rows.getJSONObject(index)
+                val id = row.getString("id")
+                AiProvider(id, row.getString("name"), row.getString("baseUrl"), row.getString("model"),
+                    AiApiFormat.from(row.optString("format")), readCredential("ai_provider_key_$id"))
+            }
+        }.getOrElse {
+            _state.value = _state.value.copy(errorMessage = "供应商配置读取失败，已保留原有配置。")
+            return
+        }
+        val selected = prefs?.getString("ai_provider_id", "").orEmpty()
+        saveAiProviders(providers, providers.firstOrNull { it.id == selected }?.id ?: providers.firstOrNull()?.id.orEmpty())
+    }
+
+    private fun saveAiProviders(providers: List<AiProvider>, selectedId: String) {
+        val selected = providers.firstOrNull { it.id == selectedId }
+        providers.forEach { settingsRepository?.queueSecret("ai_provider_key_${it.id}", it.apiKey) }
+        settingsRepository?.queueSecret(KEY_AI_API_KEY, selected?.apiKey.orEmpty())
+        prefs?.edit()?.apply {
+            putString("ai_providers", JSONArray().apply { providers.forEach { put(it.metadata()) } }.toString())
+            putString("ai_provider_id", selectedId)
+            putString(KEY_AI_BASE_URL, selected?.baseUrl.orEmpty())
+            putString(KEY_AI_MODEL, selected?.model.orEmpty())
+        }?.apply()
+        _state.value = _state.value.copy(aiProviders = providers, aiProviderId = selectedId,
+            aiBaseUrl = selected?.baseUrl.orEmpty(), aiApiKey = selected?.apiKey.orEmpty(), aiModel = selected?.model.orEmpty(),
+            aiApiFormat = selected?.format ?: AiApiFormat.CHAT_COMPLETIONS)
+    }
+
+    @Synchronized
+    fun setAiProvider(id: String) {
+        if (_state.value.aiProviders.none { it.id == id }) return
+        saveAiProviders(_state.value.aiProviders, id)
+    }
+
+    @Synchronized
+    fun setAiProviderName(name: String) {
+        val st = _state.value
+        saveAiProviders(st.aiProviders.map { if (it.id == st.aiProviderId) it.copy(name = name) else it }, st.aiProviderId)
+    }
+
+    @Synchronized
+    fun addAiProvider(preset: ProviderPreset? = null) {
+        val provider = AiProvider(UUID.randomUUID().toString(), preset?.name ?: "自定义供应商",
+            preset?.baseUrl.orEmpty(), preset?.defaultModel.orEmpty(), preset?.format ?: AiApiFormat.CHAT_COMPLETIONS)
+        saveAiProviders(_state.value.aiProviders + provider, provider.id)
+    }
+
+    @Synchronized
+    fun deleteAiProvider(id: String) {
+        val st = _state.value
+        if (st.aiProviders.none { it.id == id }) return
+        val remaining = st.aiProviders.filterNot { it.id == id }
+        settingsRepository?.queueSecret("ai_provider_key_$id", "")
+        saveAiProviders(remaining, if (st.aiProviderId == id) remaining.firstOrNull()?.id.orEmpty() else st.aiProviderId)
     }
 
     @Synchronized
@@ -959,7 +987,7 @@ object AsrManager {
 
     @Synchronized
     fun setMimoConfig(apiKey: String, voice: String, stylePrompt: String) {
-        settingsRepository?.putSecret(KEY_MIMO_API_KEY, apiKey.trim())
+        settingsRepository?.queueSecret(KEY_MIMO_API_KEY, apiKey.trim())
         prefs?.edit()?.apply {
             putString(KEY_MIMO_VOICE, voice.trim())
             putString(KEY_MIMO_STYLE, stylePrompt.trim())
@@ -1053,6 +1081,25 @@ object AsrManager {
         _state.value = _state.value.copy(errorMessage = "")
     }
 
+    /** 由界面或系统权限流程显示一条提示横幅。 */
+    fun showError(message: String) {
+        _state.value = _state.value.copy(errorMessage = message)
+    }
+
+    @Synchronized
+    fun setDiagnosticsEnabled(enabled: Boolean) {
+        prefs?.edit()?.putBoolean("diagnostics_enabled", enabled)?.apply()
+        Diagnostics.enabled = enabled
+        _state.value = _state.value.copy(diagnosticsEnabled = enabled)
+    }
+
+    /** 重播历史回复，走与正常回答相同的播报状态；正在收音时不打断用户。 */
+    fun replayMessage(content: String): Boolean {
+        val accepted = speech.replay(content)
+        if (!accepted) _state.value = _state.value.copy(errorMessage = "正在听你说话，稍后再重播。")
+        return accepted
+    }
+
     /** 恢复所有配置为出厂默认（保留对话历史）。 */
     @Synchronized
     fun resetAllSettings() {
@@ -1064,8 +1111,13 @@ object AsrManager {
             engineState = keep.engineState,
             messages = keep.messages,
             hasRoot = keep.hasRoot,
-            customWakeWords = DEFAULT_WAKE_WORDS
+            customWakeWords = DEFAULT_WAKE_WORDS,
+            voiceReady = keep.voiceReady,
+            conversationId = keep.conversationId
         )
+        prefs?.edit()?.putString(KEY_CONVERSATION, keep.conversationId)?.apply()
+        loadAiProviders()
+        Diagnostics.enabled = false
         keywordDetector.setKeywords(emptySet())
         kwsManager.updateWakeWords(DEFAULT_WAKE_WORDS)
         TtsManager.engineType = TtsEngineType.MIMO
@@ -1082,7 +1134,8 @@ object AsrManager {
     @Synchronized
     fun setListening(listening: Boolean) {
         if (!listening) {
-            volcClient.cancel()
+            cancelRecognition()
+            speech.interrupt()
             TtsManager.stop()
             _audioLevel.value = 0f
             _state.value = _state.value.copy(
@@ -1103,8 +1156,7 @@ object AsrManager {
 
     fun stopTts() {
         // 用户打断后，本轮后续生成的内容不再朗读。
-        speechStream?.let { it.muted = true; it.interrupted = true }
-        followUpPending = false
+        speech.interrupt()
         TtsManager.stop()
         if (_state.value.engineState != EngineState.SPEAKING_TTS) return
         returnToStandby()
@@ -1125,13 +1177,30 @@ object AsrManager {
         if (_state.value.engineState != EngineState.ACTIVE_LISTENING) return
         if (hasSpokenInSession || _state.value.currentText.isNotBlank()) {
             Log.i(TAG, "User ended the utterance manually. Finalizing...")
+            Diagnostics.speechEnded()
             _state.value = _state.value.copy(engineState = EngineState.PROCESSING_FINAL)
             volcClient.finish()
         } else {
             Log.i(TAG, "User cancelled listening before speaking")
-            volcClient.cancel()
+            cancelRecognition()
             returnToStandby()
         }
+    }
+
+    /**
+     * 停止当前任务：取消正在执行的前台回合并停止朗读。与只停止朗读的 [stopTts]、
+     * 停止朗读后接着听的打断词区分开；后台任务不受影响。
+     */
+    fun stopCurrentTask() {
+        val id = foregroundTaskId ?: TaskRuntime.activeForegroundTurn()?.id
+        speech.interrupt()
+        TtsManager.stop()
+        if (id != null) {
+            TaskRuntime.cancel(id)
+            foregroundTaskId = null
+        }
+        val engine = _state.value.engineState
+        if (engine == EngineState.SPEAKING_TTS || engine == EngineState.THINKING_AI) returnToStandby()
     }
 
     /** 取消当前 AI 请求并回到待机。 */
@@ -1157,7 +1226,7 @@ object AsrManager {
         )
         kwsManager.reset()
         kwsManager.resetInterrupt()
-        if (pendingAnnouncements.isNotEmpty()) scope.launch { flushAnnouncements() }
+        speech.standby()
     }
 
     /** 打断：停止播报，立即开始收音听新的指令；正在执行的任务不受影响。 */
@@ -1172,9 +1241,13 @@ object AsrManager {
         _audioLevel.value = level.coerceIn(0f, 1f)
     }
 
+    /**
+     * 录音线程每帧调用。[pcm] 的前 [length] 个采样是本帧原始数据，只在推送云端识别时才转成字节，
+     * 待机时不做这份拷贝。模型还在后台加载时直接丢弃，不在这里等待加载锁。
+     */
     @Synchronized
-    fun acceptSamples(floatSamples: FloatArray, pcmBytes: ByteArray, sampleRate: Int) {
-        if (!_state.value.isListening) return
+    fun acceptSamples(floatSamples: FloatArray, pcm: ShortArray, length: Int, sampleRate: Int) {
+        if (!_state.value.isListening || !voiceReady) return
 
         when (_state.value.engineState) {
             EngineState.WAITING_WAKEWORD -> {
@@ -1194,7 +1267,13 @@ object AsrManager {
                 // 唤醒应答还在播放（含扬声器余音）时不收音，否则应答会被识别成用户的话。
                 if (ackPlaying || System.currentTimeMillis() < listenResumeAt) return
 
-                // 1. 音频推流给火山引擎云端 WebSocket
+                // 1. 音频推流给火山引擎云端 WebSocket（握手前会排队，因此每帧单独分配字节数组）
+                val pcmBytes = ByteArray(length * 2)
+                for (i in 0 until length) {
+                    val s = pcm[i].toInt()
+                    pcmBytes[i * 2] = (s and 0xFF).toByte()
+                    pcmBytes[i * 2 + 1] = ((s shr 8) and 0xFF).toByte()
+                }
                 volcClient.sendAudio(pcmBytes)
 
                 // 2. 本地 Silero VAD 监控停顿以自动断句
@@ -1216,10 +1295,30 @@ object AsrManager {
         }
     }
 
+    @Synchronized
+    private fun cancelRecognition() {
+        recognitionGeneration++
+        ackToken++
+        volcClient.cancel()
+    }
+
+    private fun receiveRecognition(token: Long, action: () -> Unit) {
+        scope.launch {
+            synchronized(this@AsrManager) {
+                if (token == recognitionGeneration && _state.value.isListening) action()
+            }
+        }
+    }
+
+    @Synchronized
     private fun onWakeWordDetected(keyword: String, manual: Boolean, ack: Boolean = !manual, timeoutMs: Long? = null) {
         Log.i(TAG, "Wake word triggered: $keyword (manual=$manual)")
-        speechStream?.let { it.muted = true; it.interrupted = true }
-        followUpPending = false
+        if (!voiceReady || vad == null) {
+            _state.value = _state.value.copy(lastWakeWord = keyword,
+                errorMessage = if (voiceReady) "语音断句模型加载失败，请重启应用后再试；文字对话不受影响。" else "语音模型准备中，请稍候再说话。")
+            return
+        }
+        speech.interrupt()
         TtsManager.stop()
 
         val apiKey = _state.value.apiKey
@@ -1235,7 +1334,7 @@ object AsrManager {
         lastSpeechTimestamp = 0L
         sessionStartTimestamp = System.currentTimeMillis()
         sessionNoSpeechTimeoutMs = timeoutMs ?: if (manual) MANUAL_NO_SPEECH_TIMEOUT_MS else WAKE_NO_SPEECH_TIMEOUT_MS
-        pendingVadSamples = FloatArray(0)
+        vadFill = 0
         vad?.clear()
 
         val wakeCount = _state.value.totalWakeCount + 1
@@ -1255,20 +1354,25 @@ object AsrManager {
         listenResumeAt = 0L
         if (ackPlaying) scope.launch {
             // 回调里只切换协程，不在播放器的锁内获取本对象的锁。
-            TtsManager.speakAck { scope.launch { finishAck(token) } }
+            synchronized(this@AsrManager) {
+                if (token != ackToken || !ackPlaying) return@launch
+                TtsManager.speakAck { scope.launch { finishAck(token) } }
+            }
             // 播放回调丢失时的兜底，避免一直不收音。
             delay(2500)
             finishAck(token)
         }
 
+        val recognitionToken = ++recognitionGeneration
         volcClient.startSession(apiKey, _state.value.resourceId, object : VolcengineStreamAsrClient.Listener {
             override fun onConnected() {
                 Log.i(TAG, "Volcengine ASR session connected")
             }
 
             override fun onTranscriptionUpdate(text: String, isFinal: Boolean) {
-                scope.launch {
+                receiveRecognition(recognitionToken) {
                     val trimmed = text.trim()
+                    if (isFinal) cancelRecognition()
                     if (trimmed.isNotEmpty()) {
                         if (isFinal) {
                             handleFinalAsrText(trimmed, _state.value.lastWakeWord)
@@ -1282,15 +1386,20 @@ object AsrManager {
             }
 
             override fun onError(code: Int, message: String) {
-                scope.launch {
+                receiveRecognition(recognitionToken) {
+                    cancelRecognition()
                     Log.e(TAG, "Volcengine ASR Error ($code): $message")
+                    Diagnostics.failure("语音识别", "($code) $message")
                     _state.value = _state.value.copy(errorMessage = "云端识别错误($code): $message")
                     returnToStandby()
+                    // 纯语音使用时看不到横幅，说一句原因；点击麦克风的用户看着屏幕，不再出声。
+                    if (_state.value.lastWakeWord != MANUAL_WAKE_WORD) speech.notice("语音识别连接失败，请检查网络。")
                 }
             }
 
             override fun onClosed() {
-                scope.launch {
+                receiveRecognition(recognitionToken) {
+                    cancelRecognition()
                     if (_state.value.engineState == EngineState.ACTIVE_LISTENING ||
                         _state.value.engineState == EngineState.PROCESSING_FINAL
                     ) {
@@ -1309,11 +1418,12 @@ object AsrManager {
         val now = System.currentTimeMillis()
         listenResumeAt = now + 150
         sessionStartTimestamp = now
-        pendingVadSamples = FloatArray(0)
+        vadFill = 0
         vad?.clear()
     }
 
     private fun handleFinalAsrText(finalText: String, wakeWord: String) {
+        Diagnostics.asrFinal()
         val hits = keywordDetector.check(finalText)
         val userMessage = ChatMessage(
             role = "user",
@@ -1331,7 +1441,47 @@ object AsrManager {
         startTurn(ChatMessage(role = "user", content = trimmed, wakeWord = MANUAL_INPUT_WORD, hitKeywords = hits))
     }
 
+    private enum class LocalCommand { STOP_SPEAKING, STOP_TASK }
+
+    /** 只有整句就是这些短指令时才在本地处理，较长的句子照常交给模型。 */
+    private fun localCommand(text: String): LocalCommand? {
+        val normalized = text.replace(Regex("[\\s，,。.！!？?、~～…]"), "").removeSuffix("吧").removeSuffix("啊")
+        return when (normalized) {
+            in STOP_SPEAKING_PHRASES -> LocalCommand.STOP_SPEAKING
+            in STOP_TASK_PHRASES -> LocalCommand.STOP_TASK
+            else -> null
+        }
+    }
+
+    /**
+     * “别说了”只停止朗读；“停止/取消任务”停止当前会话里正在执行和排队的前台回合。
+     * 没有可停止的回合时返回 false，按普通消息交给模型。
+     */
+    private fun handleLocalCommand(command: LocalCommand, userMessage: ChatMessage): Boolean {
+        val reply = when (command) {
+            LocalCommand.STOP_SPEAKING -> {
+                speech.interrupt()
+                TtsManager.stop()
+                "好的，不念了。"
+            }
+            LocalCommand.STOP_TASK -> {
+                val pending = pendingTurns(TaskRuntime.tasks.value)
+                if (pending.isEmpty()) return false
+                speech.interrupt()
+                TtsManager.stop()
+                pending.forEach { TaskRuntime.cancel(it.id) }
+                foregroundTaskId = null
+                "好的，已停止${if (pending.size > 1) "当前和排队中的 ${pending.size} 条请求" else ""}。"
+            }
+        }
+        updateMessages { it + userMessage + ChatMessage(role = "assistant", content = reply) }
+        returnToStandby()
+        if (command == LocalCommand.STOP_TASK && userMessage.wakeWord != MANUAL_INPUT_WORD) speech.notice("好的，已停止。")
+        return true
+    }
+
     private fun startTurn(userMessage: ChatMessage) {
+        localCommand(userMessage.content)?.let { if (handleLocalCommand(it, userMessage)) return }
         val current = _state.value
         val turnCount = current.totalTurnCount + 1
         prefs?.edit()?.putInt(KEY_TURN_COUNT, turnCount)?.apply()
@@ -1375,6 +1525,7 @@ object AsrManager {
             .mapNotNull { snapshot.keywordTemplates[it] }.distinct()
         // 每条消息都是一个前台回合：直接回答、用工具还是转后台由模型决定；关闭工具时退回纯聊天。
         val source = if (snapshot.agentEnabled) "turn" else "chat"
+        val conversation = snapshot.conversationId
         var goal = if (boundTargets.isEmpty()) userText
             else userText + "\n\n用户为这句话命中的关键词绑定了任务模板，请按模板完成：\n" + boundTargets.joinToString("\n\n")
         // 提交后立即回到唤醒待机；执行由独立服务负责。
@@ -1406,10 +1557,11 @@ object AsrManager {
                         OverlapDecision.QUEUE -> Unit
                     }
                 }
-                val id = TaskRuntime.submit(goal, history = history, source = source, promptSuffix = if (voice) VOICE_TURN_HINT else "")
+                val id = TaskRuntime.submit(goal, conversationId = conversation, history = history, source = source,
+                    promptSuffix = if (voice) VOICE_TURN_HINT else "")
+                Diagnostics.turnSubmitted(id, voice, userText)
                 foregroundTaskId = id
-                speechStream = SpeechStream(id, voice)
-                if (voice && _state.value.progressNarration && _state.value.ttsEnabled) startNarration(id)
+                speech.start(id, voice)
                 updateMessages { list -> list.map { if (it.id == assistantMsgId) it.copy(taskId = id) else it } }
             } catch (error: Exception) {
                 Log.e(TAG, "Task submission failed", error)
@@ -1431,12 +1583,17 @@ object AsrManager {
 
     private fun processVad(samples: FloatArray) {
         val v = vad ?: return
-        pendingVadSamples = pendingVadSamples + samples
-
-        while (pendingVadSamples.size >= VAD_WINDOW_SIZE) {
-            val chunk = pendingVadSamples.copyOfRange(0, VAD_WINDOW_SIZE)
-            pendingVadSamples = pendingVadSamples.copyOfRange(VAD_WINDOW_SIZE, pendingVadSamples.size)
-            v.acceptWaveform(chunk)
+        // 凑满一个窗口送一次；VAD 会复制传入的数据，窗口缓冲可以反复使用。
+        var offset = 0
+        while (offset < samples.size) {
+            val count = minOf(VAD_WINDOW_SIZE - vadFill, samples.size - offset)
+            System.arraycopy(samples, offset, vadWindow, vadFill, count)
+            vadFill += count
+            offset += count
+            if (vadFill == VAD_WINDOW_SIZE) {
+                v.acceptWaveform(vadWindow)
+                vadFill = 0
+            }
         }
 
         val now = System.currentTimeMillis()
@@ -1454,26 +1611,32 @@ object AsrManager {
         if (hasSpokenInSession) {
             if (!isSpeaking && (now - lastSpeechTimestamp) >= SPEECH_SILENCE_TIMEOUT_MS) {
                 Log.i(TAG, "VAD detected end of speech (silence > ${SPEECH_SILENCE_TIMEOUT_MS}ms). Finalizing...")
+                Diagnostics.speechEnded()
                 _state.value = _state.value.copy(engineState = EngineState.PROCESSING_FINAL)
                 volcClient.finish()
             }
         } else {
             if ((now - sessionStartTimestamp) >= sessionNoSpeechTimeoutMs) {
                 Log.i(TAG, "Wake session timed out without speech. Returning to wake word listening.")
-                volcClient.cancel()
+                cancelRecognition()
                 returnToStandby()
+                // 喊了唤醒词却没听到下文：说一句让人知道已回到待机。连续对话、打断和点击唤醒的超时保持安静。
+                val source = _state.value.lastWakeWord
+                if (source !in setOf(MANUAL_WAKE_WORD, FOLLOW_UP_WORD, INTERRUPT_SOURCE)) scope.launch { speech.notice("没听到你说话，需要时再叫我。") }
             }
         }
     }
 
     @Synchronized
     fun release() {
-        volcClient.cancel()
+        cancelRecognition()
+        speech.reset()
         TtsManager.shutdown()
         kwsManager.release()
         vad?.release()
         vad = null
-        pendingVadSamples = FloatArray(0)
+        vadFill = 0
+        voiceReady = false
         _state.value = AsrState()
     }
 }

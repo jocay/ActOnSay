@@ -86,6 +86,21 @@ class Schedules:
             return CronTrigger.from_crontab(expression, timezone=zone)
         raise ValueError("调度方式必须是 once、interval 或 cron")
 
+    def preview(self, data: dict, count: int = 5) -> dict:
+        """按与正式调度相同的触发规则预览未来几次时间；只读取时间相关字段，不保存。"""
+        timing = {key: data[key] for key in ("schedule_type", "run_at", "interval_seconds", "cron", "timezone", "anchor") if data.get(key) is not None}
+        definition = self.definition({"name": "preview", "kind": "ai", "goal": "preview"} | timing)
+        trigger = self.trigger(definition)
+        zone = ZoneInfo(definition["timezone"])
+        runs, previous, cursor = [], None, datetime.now(timezone.utc)
+        for _ in range(max(1, min(int(count), 10))):
+            upcoming = trigger.get_next_fire_time(previous, cursor)
+            if upcoming is None:
+                break
+            runs.append(upcoming.astimezone(zone).isoformat())
+            previous, cursor = upcoming, upcoming + timedelta(microseconds=1)
+        return {"timezone": definition["timezone"], "next_runs": runs}
+
     def public(self, row: dict) -> dict:
         value = json.loads(row["definition"])
         # API 列表不回显脚本环境中的凭据。

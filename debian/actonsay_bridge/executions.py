@@ -7,6 +7,7 @@ import mimetypes
 import os
 import re
 import signal
+import time
 import uuid
 from pathlib import Path
 from urllib.parse import quote
@@ -16,6 +17,8 @@ from .store import Store, encode, now
 
 
 FINAL = {"succeeded", "failed", "cancelled", "result_unknown"}
+# 执行中日志大小的落库间隔（秒）。
+LOG_META_INTERVAL = 2.0
 
 
 def process_stamp(pid: int) -> str | None:
@@ -28,6 +31,24 @@ def process_stamp(pid: int) -> str | None:
 
 def boot_id() -> str:
     return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+
+
+def orphan_groups(execution_id: str) -> set[int]:
+    """按执行环境变量找回启动中途失去记录的进程组；读不到的进程直接跳过。"""
+    marker = f"ACTONSAY_EXECUTION_ID={execution_id}".encode()
+    own = os.getpgid(0)
+    groups = set()
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if marker in (entry / "environ").read_bytes().split(b"\0"):
+                group = os.getpgid(int(entry.name))
+                if group != own:
+                    groups.add(group)
+        except (OSError, ProcessLookupError):
+            continue
+    return groups
 
 
 class Executions:
@@ -102,6 +123,14 @@ class Executions:
                 except ProcessLookupError:
                     pass
             self.finish(row, "result_unknown", None, "service_interrupted")
+        # 启动中途崩溃时进程可能已经开始但没有记下 pid：按环境变量清理残留进程组，结果一律待确认，不再重跑。
+        for row in self.store.all("SELECT * FROM executions WHERE status='starting'"):
+            for group in orphan_groups(row["id"]):
+                try:
+                    os.killpg(group, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            self.finish(row, "result_unknown", None, "interrupted_while_starting")
         for row in self.store.all("SELECT * FROM executions WHERE status='queued' ORDER BY created_at"):
             self.enqueue(row["id"])
 
@@ -201,6 +230,9 @@ class Executions:
         log = self.run_dir(row) / "output.log"
         written = 0
         truncated = False
+        # 日志元数据按时间合并写库，值未变化时跳过；结束时下面再强制保存一次。
+        saved = (0, False)
+        saved_at = time.monotonic()
         # 留下最长凭据长度的尾部，避免凭据跨 stdout 分块时泄漏。
         tail = ""
         reserve = max(256, max((len(value) for value in self.redactor.values), default=256))
@@ -221,7 +253,9 @@ class Executions:
                     output.write(encoded[:remaining])
                     written += min(len(encoded), remaining)
                 truncated = truncated or len(encoded) > remaining
-                self.store.execute("UPDATE executions SET log_size=?,log_truncated=? WHERE id=?", (written, int(truncated), row["id"]))
+                if (written, truncated) != saved and time.monotonic() - saved_at >= LOG_META_INTERVAL:
+                    self.store.execute("UPDATE executions SET log_size=?,log_truncated=? WHERE id=?", (written, int(truncated), row["id"]))
+                    saved, saved_at = (written, truncated), time.monotonic()
             tail += decoder.decode(b"", final=True)
             encoded = self.redactor.text(tail).encode("utf-8")
             remaining = max(0, self.config.max_log_bytes - written)
@@ -236,8 +270,13 @@ class Executions:
         reader = None
         try:
             async with self.semaphore:
-                if execution_id in self.cancelled or self.get(execution_id)["status"] != "queued":
+                if execution_id in self.cancelled:
                     return
+                # 先持久化“启动中”再创建进程：两步之间崩溃时，恢复按结果待确认处理，绝不当作排队任务再跑一次。
+                with self.store.transaction() as db:
+                    started = db.execute("UPDATE executions SET status='starting',started_at=? WHERE id=? AND status='queued'", (now(), execution_id))
+                    if started.rowcount != 1:
+                        return
                 directory = self.run_dir(row)
                 directory.mkdir(parents=True, exist_ok=True, mode=0o700)
                 (directory / "artifacts").mkdir(exist_ok=True, mode=0o700)
@@ -247,11 +286,11 @@ class Executions:
                 env.update(ACTONSAY_TASK_ID=row["task_id"], ACTONSAY_EXECUTION_ID=row["id"], ACTONSAY_ARTIFACT_DIR=str(directory / "artifacts"))
                 process = await asyncio.create_subprocess_exec("/bin/bash", "-lc", row["command"], cwd=row["cwd"], env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, start_new_session=True)
                 self.processes[execution_id] = process
-                if execution_id in self.cancelled or self.get(execution_id)["status"] != "queued":
+                if execution_id in self.cancelled or self.get(execution_id)["status"] != "starting":
                     await self.terminate(process)
                     self.finish(row, "cancelled", process.returncode, "cancelled")
                     return
-                self.store.execute("UPDATE executions SET status='running',started_at=?,pid=?,process_start=?,boot_id=? WHERE id=?", (now(), process.pid, process_stamp(process.pid), boot_id(), execution_id))
+                self.store.execute("UPDATE executions SET status='running',pid=?,process_start=?,boot_id=? WHERE id=?", (process.pid, process_stamp(process.pid), boot_id(), execution_id))
                 self.store.event("execution.running", execution_id, self.public(self.get(execution_id)), row["task_id"])
                 reader = asyncio.create_task(self.drain(row, process))
                 timed_out = False
@@ -279,9 +318,10 @@ class Executions:
             if reader:
                 reader.cancel()
                 await asyncio.gather(reader, return_exceptions=True)
-            if self.get(execution_id)["status"] not in FINAL:
-                # 还未启动的队列任务在服务升级后可安全恢复。
-                if not (self.closed and process is None):
+            status = self.get(execution_id)["status"]
+            if status not in FINAL:
+                # 还未启动的队列任务在服务升级后可安全恢复；已进入启动的按结果待确认处理。
+                if not (self.closed and status == "queued"):
                     self.finish(row, "result_unknown" if self.closed else "cancelled", process.returncode if process else None, "service_interrupted" if self.closed else "cancelled")
         except Exception:
             if process:

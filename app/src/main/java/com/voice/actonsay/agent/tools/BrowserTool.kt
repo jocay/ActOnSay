@@ -1,6 +1,7 @@
 package com.voice.actonsay.agent.tools
 
 import com.voice.actonsay.agent.AgentTool
+import com.voice.actonsay.agent.ResourceLeases
 import com.voice.actonsay.agent.ToolContext
 import com.voice.actonsay.agent.ToolResult
 import com.voice.actonsay.agent.schemaObject
@@ -15,7 +16,7 @@ class BrowserTool : AgentTool {
     override val description = "应用内置的浏览器，能运行网页脚本、点击和填写表单，用于 fetch_url 读不出内容的动态网页或需要交互的网站。" +
         "每个动作后返回页面标题、正文和带编号的可交互元素（格式：编号|标签|文字|链接）。" +
         "action：open 打开网址；read 重新读取当前页；click 点击第 index 个元素；type 在第 index 个输入框填入 text（submit=true 时回车提交）；" +
-        "scroll 翻页（direction=down/up）；back 后退；close 关闭。"
+        "scroll 翻页（direction=down/up）；back 后退；close 关闭。浏览器同一时间只供一个任务使用，页面变化后旧编号失效，需先 read。"
     override val parameters = schemaObject(
         "action" to schemaProp("string", "动作", listOf("open", "read", "click", "type", "scroll", "back", "close")),
         "url" to schemaProp("string", "open：http(s) 网址"),
@@ -28,8 +29,20 @@ class BrowserTool : AgentTool {
     )
 
     override suspend fun execute(args: JSONObject, ctx: ToolContext): ToolResult {
+        val action = args.optString("action")
+        val owner = ctx.taskId.ifBlank { "interactive" }
+        if (!ResourceLeases.browser.acquire(ctx.taskId)) {
+            return ToolResult.failure("浏览器正被另一个任务使用，请稍后再试，或改用 fetch_url 读取静态网页", "RESOURCE_BUSY")
+        }
         val limit = args.optInt("max_chars", 6000).coerceIn(500, 20_000)
-        val note: String = when (args.optString("action")) {
+        // 点击和输入依赖上次读取的编号：页面在此期间被导航、重新编号或被用户操作过时拒绝执行，避免点错元素。
+        if (action == "click" || action == "type") {
+            val known = synchronized(readVersions) { readVersions[owner] }
+            if (known == null || known != AgentBrowser.pageVersion) {
+                return ToolResult.failure("页面在上次读取之后已经变化，元素编号可能对不上。请先 read 获取最新编号再操作", "STALE_PAGE")
+            }
+        }
+        val note: String = when (action) {
             "open" -> {
                 val url = args.optString("url").trim().let { if (it.startsWith("http")) it else "https://$it" }.toHttpUrlOrNull()
                     ?: return ToolResult.failure("网址不合法", "INVALID_ARGUMENT")
@@ -52,17 +65,30 @@ class BrowserTool : AgentTool {
             }
             "scroll" -> { AgentBrowser.scroll(args.optString("direction") != "up"); "已翻页" }
             "back" -> if (AgentBrowser.back()) "已后退" else "没有可后退的页面"
-            "close" -> { AgentBrowser.close(); return ToolResult.success("浏览器已关闭") }
+            "close" -> {
+                AgentBrowser.close()
+                synchronized(readVersions) { readVersions.remove(owner) }
+                ResourceLeases.browser.release(ctx.taskId)
+                return ToolResult.success("浏览器已关闭")
+            }
             else -> return ToolResult.failure("不支持的 action", "INVALID_ARGUMENT")
         }
         ctx.checkCancelled()
         val page = try { AgentBrowser.read(limit) } catch (error: Exception) {
             return ToolResult.failure("$note，但读取页面失败：${error.message}", "PAGE_UNREADABLE")
         }
+        synchronized(readVersions) { readVersions[owner] = page.optLong("version") }
         val elements = page.optJSONArray("elements")
         val elementText = if (elements == null) "" else (0 until elements.length()).joinToString("\n") { elements.optString(it) }
         val truncated = page.optInt("text_length") > limit
         return ToolResult.success("$note\n标题：${page.optString("title")}\n地址：${page.optString("url")}\n\n正文${if (truncated) "（已截断，可 scroll 或调大 max_chars）" else ""}：\n" +
             page.optString("text") + "\n\n可交互元素：\n" + elementText.ifBlank { "（无）" })
+    }
+
+    companion object {
+        /** 每个任务最近一次读取到的页面版本；只保留最近的若干任务。 */
+        private val readVersions = object : LinkedHashMap<String, Long>(16, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?) = size > 32
+        }
     }
 }

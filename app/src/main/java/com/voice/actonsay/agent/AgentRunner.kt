@@ -5,6 +5,7 @@ import android.util.Log
 import android.util.Base64
 import com.voice.actonsay.agent.tools.*
 import com.voice.actonsay.ai.ChatTurn
+import com.voice.actonsay.ai.AiApiFormat
 import com.voice.actonsay.ai.OpenAiClient
 import com.voice.actonsay.ai.ToolCall
 import com.voice.actonsay.bridge.BridgeClient
@@ -21,7 +22,8 @@ import java.io.File
 data class AgentConfig(
     val baseUrl: String, val apiKey: String, val model: String, val systemPrompt: String, val stream: Boolean,
     val maxSteps: Int = 30, val maxContextChars: Int = 60_000, val maxTaskSeconds: Int = 1800,
-    val supportsImages: Boolean = false
+    val supportsImages: Boolean = false,
+    val apiFormat: AiApiFormat = AiApiFormat.CHAT_COMPLETIONS
 )
 data class AgentStep(val tool: String, val summary: String, val ok: Boolean) {
     fun render(): String = (if (ok) "✓ " else "✗ ") + summary
@@ -51,11 +53,12 @@ object AgentRunner {
         val context = appContext ?: return@withContext Result.failure(IllegalStateException("AgentRunner 未初始化"))
         var messages = resumeMessages ?: OpenAiClient.buildMessages(config.systemPrompt, history, userMessage)
         val extensionCatalog = BridgeExtensionCatalog.prepare(taskId)
-        if (resumeMessages == null && extensionCatalog.isNotBlank()) {
-            messages.put(JSONObject().put("role", "system").put("content", extensionCatalog))
+        if (resumeMessages == null && extensionCatalog.summary.isNotBlank()) {
+            messages.put(JSONObject().put("role", "system").put("content", extensionCatalog.summary))
         }
         observer?.checkpoint(messages)
-        val tools = ToolRegistry.toOpenAiTools()
+        val taskTools = extensionCatalog.tools
+        val tools = ToolRegistry.toOpenAiTools(taskTools.values)
         var failures = 0
         var toolCount = 0
         val imageBudgetUsed = mutableSetOf<String>()
@@ -89,7 +92,7 @@ object AgentRunner {
                 if (call.id in completed) continue
                 if (++toolCount > maxSteps) throw IllegalStateException("工具调用已达到任务预算")
                 val ctx = ToolContext(context, onProgress, taskId, call.id, currentCoroutineContext()[Job], observer = observer)
-                val result = observer?.beginTool(call) ?: executeCall(call, ctx)
+                val result = observer?.beginTool(call) ?: executeCall(call, ctx, taskTools)
                 observer?.finishTool(call, result)
                 onStep(AgentStep(call.name, call.name + "：" + if (result.ok) "已完成" else result.output.take(80), result.ok))
                 failures = if (result.ok) 0 else failures + 1
@@ -156,7 +159,7 @@ object AgentRunner {
             observer?.checkpoint(messages)
             onProgress(if (round == 0) "思考中…" else "思考下一步…")
             val response = OpenAiClient.complete(config.baseUrl, config.apiKey, config.model, messages,
-                tools, config.stream, onDelta).getOrElse { return@withContext Result.failure(it) }
+                tools, config.stream, onDelta, config.apiFormat).getOrElse { return@withContext Result.failure(it) }
             if (!response.hasToolCalls) {
                 if (response.content.isBlank()) return@withContext Result.failure(Exception("模型回复内容为空"))
                 messages.put(JSONObject().put("role", "assistant").put("content", response.content))
@@ -166,7 +169,7 @@ object AgentRunner {
             messages.put(JSONObject().put("role", "assistant").put("content", response.content).put("tool_calls", JSONArray().apply {
                 response.toolCalls.forEach { call -> put(JSONObject().put("id", call.id).put("type", "function")
                     .put("function", JSONObject().put("name", call.name).put("arguments", call.arguments))) }
-            }))
+            }).apply { response.providerOutput?.let { put("provider_output", it) } })
             observer?.checkpoint(messages)
             executePending()
             if (round == maxSteps - 2) messages.put(JSONObject().put("role", "system").put("content", "预算将用尽，请下一条给出已完成结果和仍未完成部分。"))
@@ -174,8 +177,8 @@ object AgentRunner {
         Result.failure(Exception("任务超过 $maxSteps 轮预算，已停止"))
     }
 
-    private suspend fun executeCall(call: ToolCall, ctx: ToolContext): ToolResult {
-        val tool = ToolRegistry.get(call.name) ?: return ToolResult.failure("没有名为 ${call.name} 的工具", "UNKNOWN_TOOL")
+    private suspend fun executeCall(call: ToolCall, ctx: ToolContext, taskTools: Map<String, AgentTool>): ToolResult {
+        val tool = ToolRegistry.get(call.name) ?: taskTools[call.name] ?: return ToolResult.failure("没有名为 ${call.name} 的工具", "UNKNOWN_TOOL")
         val args = try { JSONObject(call.arguments.ifBlank { "{}" }) } catch (_: Exception) {
             return ToolResult.failure("工具参数不是合法 JSON", "INVALID_ARGUMENT")
         }
@@ -217,7 +220,8 @@ object AgentRunner {
             return (0 until content.length()).mapNotNull { content.optJSONObject(it)?.takeIf { part -> part.optString("type") == "text" }?.optString("text") }.joinToString("\n")
         }
         fun sizeOf(row: JSONObject) = textContent(row).length + (row.optJSONArray("content")?.length() ?: 0) * 4000 +
-            (row.optJSONArray("tool_calls")?.toString()?.length ?: 0) + 100
+            (row.optJSONArray("tool_calls")?.toString()?.length ?: 0) +
+            (row.optJSONObject("provider_output")?.toString()?.length ?: 0) + 100
         if (rows.sumOf { sizeOf(it) } <= limit) return input
         var start = rows.size - 1
         var size = 0

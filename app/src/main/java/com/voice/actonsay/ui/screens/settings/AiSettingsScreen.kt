@@ -11,10 +11,13 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
@@ -37,6 +40,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.voice.actonsay.agent.ToolRegistry
 import com.voice.actonsay.ai.OpenAiClient
+import com.voice.actonsay.ai.AiApiFormat
 import com.voice.actonsay.asr.AsrManager
 import com.voice.actonsay.ai.FastDecisionClient
 import com.voice.actonsay.ui.components.FieldSpacer
@@ -65,8 +69,33 @@ fun AiSettingsScreen(onBack: () -> Unit) {
 
     var testing by remember { mutableStateOf(false) }
     var testResult by remember { mutableStateOf<Pair<Boolean, String>?>(null) }
+    var adding by remember { mutableStateOf(false) }
+    var deleting by remember { mutableStateOf(false) }
+    var format by remember(state.aiApiFormat) { mutableStateOf(state.aiApiFormat) }
 
-    fun commitEndpoint() = AsrManager.setAiEndpoint(baseUrl, apiKey, model)
+    fun commitEndpoint() = AsrManager.setAiEndpoint(baseUrl, apiKey, model, format)
+
+    if (adding) AlertDialog(
+        onDismissRequest = { adding = false },
+        title = { Text("添加供应商") },
+        text = {
+            Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                SettingHint("选择模板后填写自己的密钥，也可添加自定义接口。")
+                OpenAiClient.PRESETS.forEach { preset ->
+                    TextButton(onClick = { AsrManager.addAiProvider(preset); testResult = null; adding = false }) { Text(preset.name) }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = { AsrManager.addAiProvider(); testResult = null; adding = false }) { Text("自定义接口") } },
+        dismissButton = { TextButton(onClick = { adding = false }) { Text("取消") } }
+    )
+    if (deleting) AlertDialog(
+        onDismissRequest = { deleting = false },
+        title = { Text("删除供应商") },
+        text = { Text("删除此供应商的配置和密钥？已启动的任务继续使用启动时的配置。") },
+        confirmButton = { TextButton(onClick = { AsrManager.deleteAiProvider(state.aiProviderId); testResult = null; deleting = false }) { Text("删除") } },
+        dismissButton = { TextButton(onClick = { deleting = false }) { Text("取消") } }
+    )
 
     SubPageScaffold(title = "AI 模型", onBack = { commitEndpoint(); AsrManager.setAiSystemPrompt(prompt); onBack() }) {
         SectionCard {
@@ -80,33 +109,47 @@ fun AiSettingsScreen(onBack: () -> Unit) {
         }
 
         SectionCard(title = "服务商") {
-            SettingHint("选择预设会填入 Base URL 与默认模型，API Key 需要自行填写。")
+            SettingHint("每个供应商独立保存接口、密钥和模型。选择后用于新对话和新任务。")
             FlowRow(
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalArrangement = Arrangement.spacedBy(2.dp)
             ) {
-                OpenAiClient.PRESETS.forEach { preset ->
-                    val selected = baseUrl.trimEnd('/') == preset.baseUrl.trimEnd('/')
+                state.aiProviders.forEach { provider ->
+                    val selected = state.aiProviderId == provider.id
                     FilterChip(
                         selected = selected,
                         onClick = {
-                            baseUrl = preset.baseUrl
-                            model = preset.defaultModel
+                            AsrManager.setAiProvider(provider.id)
                             testResult = null
-                            commitEndpoint()
                         },
-                        label = { Text(preset.name) },
+                        label = { Text(provider.name.ifBlank { "未命名供应商" }) },
                         leadingIcon = if (selected) {
                             { Icon(Icons.Default.Check, null, modifier = Modifier.size(16.dp)) }
                         } else null
                     )
                 }
             }
-            val activePreset = OpenAiClient.PRESETS.firstOrNull { baseUrl.trimEnd('/') == it.baseUrl.trimEnd('/') }
-            if (activePreset != null) SettingHint(activePreset.description)
+            Row(modifier = Modifier.padding(horizontal = 16.dp)) {
+                TextButton(onClick = { adding = true }, enabled = !testing) { Text("添加供应商") }
+                TextButton(onClick = { deleting = true }, enabled = state.aiProviders.isNotEmpty() && !testing) { Text("删除当前供应商") }
+            }
 
+            if (state.aiProviders.isNotEmpty()) {
             Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                OutlinedTextField(
+                    value = state.aiProviders.firstOrNull { it.id == state.aiProviderId }?.name.orEmpty(),
+                    onValueChange = { AsrManager.setAiProviderName(it) },
+                    label = { Text("供应商名称") }, singleLine = true,
+                    shape = MaterialTheme.shapes.medium, modifier = Modifier.fillMaxWidth()
+                )
+                FieldSpacer()
+                Text("接口格式", style = MaterialTheme.typography.labelLarge)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    AiApiFormat.entries.forEach { option ->
+                        FilterChip(selected = format == option, onClick = { format = option; testResult = null; commitEndpoint() }, label = { Text(option.label) })
+                    }
+                }
                 OutlinedTextField(
                     value = baseUrl,
                     onValueChange = { baseUrl = it; testResult = null; commitEndpoint() },
@@ -115,7 +158,7 @@ fun AiSettingsScreen(onBack: () -> Unit) {
                     singleLine = true,
                     shape = MaterialTheme.shapes.medium,
                     textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
-                    supportingText = { Text("自动补全 /chat/completions", style = MaterialTheme.typography.bodySmall) },
+                    supportingText = { Text("按接口格式补全请求路径；也可填写完整接口地址", style = MaterialTheme.typography.bodySmall) },
                     modifier = Modifier.fillMaxWidth()
                 )
                 FieldSpacer()
@@ -124,7 +167,7 @@ fun AiSettingsScreen(onBack: () -> Unit) {
                     onValueChange = { apiKey = it; testResult = null; commitEndpoint() },
                     label = "API Key",
                     placeholder = "sk-…",
-                    supportingText = if (apiKey.isBlank()) "必填。本地 Ollama 等无鉴权服务可填任意字符" else null
+                    supportingText = if (apiKey.isBlank()) "本地无鉴权服务可留空，云端接口请填写密钥" else null
                 )
                 FieldSpacer()
                 OutlinedTextField(
@@ -143,10 +186,12 @@ fun AiSettingsScreen(onBack: () -> Unit) {
                             commitEndpoint()
                             testing = true
                             testResult = null
+                            val snapshot = state.aiProviders.first { it.id == state.aiProviderId }
                             scope.launch {
-                                val res = OpenAiClient.testConnection(baseUrl, apiKey, model)
+                                val res = OpenAiClient.testConnection(snapshot.baseUrl, snapshot.apiKey, snapshot.model, snapshot.format)
                                 testing = false
-                                testResult = res.fold(
+                                val current = AsrManager.state.value
+                                if (current.aiProviderId == snapshot.id && current.aiProviders.firstOrNull { it.id == snapshot.id } == snapshot) testResult = res.fold(
                                     onSuccess = { true to "连接成功，模型回复：${it.take(60)}" },
                                     onFailure = { false to (it.localizedMessage ?: "未知错误") }
                                 )
@@ -180,6 +225,7 @@ fun AiSettingsScreen(onBack: () -> Unit) {
                         )
                     }
                 }
+            }
             }
         }
 

@@ -42,6 +42,7 @@ bash /opt/actonsay-bridge/source/install.sh --non-interactive
 | `GET /v1/events/stream?after=0` | Bearer 鉴权的 SSE 事件流 |
 | `GET/PATCH /v1/automation` | 持久化全局暂停：`{paused:true}`；进行中的任务继续 |
 | `GET/POST /v1/schedules`、`GET/PATCH/DELETE /v1/schedules/{id}` | 自动化计划 CRUD |
+| `POST /v1/schedules/preview` | 按正式调度规则预览接下来几次触发时间（只读时间字段，不保存） |
 | `GET /v1/triggers?schedule_id=` | 最近触发与跳过记录 |
 | `GET /v1/ai-triggers` | AI 等待队列：`{triggers:[...]}` |
 | `POST /v1/ai-triggers/{id}/claim` | `{owner_id}`，领取租约 120 秒 |
@@ -90,7 +91,7 @@ ID 使用 1 至 128 个 ASCII 字母、数字、下划线、点或短横线，�
 
 命令以新 session/进程组启动，取消、超时和正常父进程退出后均清理该组子进程。服务由 systemd 的 `KillMode=control-group` 进一步回收进程。显式创建新 session 的恶意 Root 脚本能绕过进程组边界；本版本面向用户信任的专用设备高度自主模式，Root 并非隔离沙箱。
 
-服务恢复时仅在 PID、Linux boot ID 和 `/proc` 启动时间均匹配时终止原组，避免向复用 PID 发信号；历史 `running` 记录标记 `result_unknown`。Shell/MCP 已产生副作用的执行均不自动重试。Android 应查询原 ID，展示结果待确认并提供明确重跑入口。
+服务恢复时仅在 PID、Linux boot ID 和 `/proc` 启动时间均匹配时终止原组，避免向复用 PID 发信号；历史 `running` 记录标记 `result_unknown`。创建进程前先把状态持久化为 `starting`：若在启动与记录 PID 之间崩溃，恢复时按 `ACTONSAY_EXECUTION_ID` 环境变量清理残留进程组，并标记 `result_unknown`（`interrupted_while_starting`），不会作为排队任务再执行一次。执行中的日志大小约每 2 秒合并写库一次，结束时强制保存。Shell/MCP 已产生副作用的执行均不自动重试。Android 应查询原 ID，展示结果待确认并提供明确重跑入口。
 
 ## 调度与 AI 接收
 

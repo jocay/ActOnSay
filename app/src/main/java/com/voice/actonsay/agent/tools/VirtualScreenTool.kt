@@ -1,6 +1,7 @@
 package com.voice.actonsay.agent.tools
 
 import com.voice.actonsay.agent.AgentTool
+import com.voice.actonsay.agent.ResourceLeases
 import com.voice.actonsay.agent.ToolContext
 import com.voice.actonsay.agent.ToolResult
 import com.voice.actonsay.agent.VirtualScreen
@@ -39,8 +40,13 @@ class VirtualScreenTool : AgentTool {
     override suspend fun execute(args: JSONObject, ctx: ToolContext): ToolResult {
         val action = args.optString("action")
         if (!ctx.requireAndroidRoot()) return ToolResult.failure("虚拟屏需要 root 权限", "ROOT_UNAVAILABLE")
+        // 截图坐标只对当前任务看到的画面有效：同一时间只让一个任务操作虚拟屏。
+        if (!ResourceLeases.virtualScreen.acquire(ctx.taskId)) {
+            return ToolResult.failure("虚拟屏正被另一个任务使用，请稍后再试", "RESOURCE_BUSY")
+        }
         if (action == "close") {
             VirtualScreen.close()
+            ResourceLeases.virtualScreen.release(ctx.taskId)
             return ToolResult.success("虚拟屏已关闭")
         }
         if (!AsrManager.state.value.aiVisionEnabled) {

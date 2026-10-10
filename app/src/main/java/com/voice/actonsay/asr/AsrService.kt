@@ -108,7 +108,7 @@ class AsrService : Service() {
 
     private fun describeState(state: AsrState): String = when (state.engineState) {
         EngineState.IDLE -> "语音助手已停止"
-        EngineState.WAITING_WAKEWORD -> {
+        EngineState.WAITING_WAKEWORD -> if (!state.voiceReady) "语音模型准备中…" else {
             val words = state.customWakeWords.joinToString("、")
             if (words.isBlank()) "待机中 · 等待唤醒" else "待机中 · 呼叫「$words」"
         }
@@ -154,20 +154,18 @@ class AsrService : Service() {
 
         recordingThread = Thread {
             val buffer = ShortArray(bufferSize / 2)
+            // 绝大多数帧都读满缓冲区，复用同一个浮点数组；唤醒词与 VAD 引擎都会复制传入的数据。
+            val fullFrame = FloatArray(buffer.size)
             var lastLevelReport = 0L
             while (isRecording) {
                 val read = audioRecord?.read(buffer, 0, buffer.size) ?: -1
                 if (read > 0) {
-                    val floatSamples = FloatArray(read)
-                    val pcmBytes = ByteArray(read * 2)
+                    val floatSamples = if (read == fullFrame.size) fullFrame else FloatArray(read)
                     var sumSquares = 0.0
                     for (i in 0 until read) {
-                        val s = buffer[i].toInt()
-                        val f = s / 32768.0f
+                        val f = buffer[i] / 32768.0f
                         floatSamples[i] = f
                         sumSquares += (f * f).toDouble()
-                        pcmBytes[i * 2] = (s and 0xFF).toByte()
-                        pcmBytes[i * 2 + 1] = ((s shr 8) and 0xFF).toByte()
                     }
 
                     val now = System.currentTimeMillis()
@@ -178,7 +176,7 @@ class AsrService : Service() {
                         lastLevelReport = now
                     }
 
-                    AsrManager.acceptSamples(floatSamples, pcmBytes, SAMPLE_RATE)
+                    AsrManager.acceptSamples(floatSamples, buffer, read, SAMPLE_RATE)
                 }
             }
         }.also { it.name = "asr-record"; it.start() }

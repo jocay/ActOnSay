@@ -21,7 +21,8 @@ data class ProviderPreset(
     val name: String,
     val baseUrl: String,
     val defaultModel: String,
-    val description: String
+    val description: String,
+    val format: AiApiFormat = AiApiFormat.CHAT_COMPLETIONS
 )
 
 /** 一轮历史对话，role 为 "user" 或 "assistant"。 */
@@ -31,7 +32,7 @@ data class ChatTurn(val role: String, val content: String)
 data class ToolCall(val id: String, val name: String, val arguments: String)
 
 /** 一次 chat completion 的结果：文本内容与（可能为空的）工具调用列表。 */
-data class ChatResponse(val content: String, val toolCalls: List<ToolCall>) {
+data class ChatResponse(val content: String, val toolCalls: List<ToolCall>, val providerOutput: JSONObject? = null) {
     val hasToolCalls: Boolean get() = toolCalls.isNotEmpty()
 }
 
@@ -64,6 +65,9 @@ object OpenAiClient {
             defaultModel = "deepseek-ai/DeepSeek-V3",
             description = "国内高并发 API"
         ),
+        ProviderPreset("OpenAI Responses", "https://api.openai.com/v1", "gpt-4o-mini", "OpenAI Responses 原生接口", AiApiFormat.RESPONSES),
+        ProviderPreset("Claude", "https://api.anthropic.com/v1", "claude-sonnet-4-5", "Anthropic Messages 原生接口", AiApiFormat.CLAUDE),
+        ProviderPreset("Gemini", "https://generativelanguage.googleapis.com/v1beta", "gemini-2.5-flash", "Google Gemini 原生接口", AiApiFormat.GEMINI),
         ProviderPreset(
             name = "本地 Ollama",
             baseUrl = "http://10.0.2.2:11434/v1",
@@ -83,12 +87,7 @@ object OpenAiClient {
         .build()
 
     fun normalizeUrl(baseUrl: String): String {
-        val trimmed = baseUrl.trim().trimEnd('/')
-        return when {
-            trimmed.endsWith("/chat/completions") -> trimmed
-            trimmed.endsWith("/v1") -> "$trimmed/chat/completions"
-            else -> "$trimmed/v1/chat/completions"
-        }
+        return AiProtocol.url(baseUrl, "", AiApiFormat.CHAT_COMPLETIONS, false)
     }
 
     /** 组装 system + 历史 + 本轮 user 的 messages 数组。 */
@@ -129,10 +128,11 @@ object OpenAiClient {
         userMessage: String,
         history: List<ChatTurn> = emptyList(),
         stream: Boolean = false,
-        onDelta: ((String) -> Unit)? = null
+        onDelta: ((String) -> Unit)? = null,
+        format: AiApiFormat = AiApiFormat.CHAT_COMPLETIONS
     ): Result<String> {
         val messages = buildMessages(systemPrompt, history, userMessage)
-        return complete(baseUrl, apiKey, model, messages, tools = null, stream = stream, onDelta = onDelta)
+        return complete(baseUrl, apiKey, model, messages, tools = null, stream = stream, onDelta = onDelta, format = format)
             .mapCatching { resp ->
                 if (resp.content.isBlank()) throw Exception("模型回复内容为空")
                 resp.content
@@ -150,18 +150,19 @@ object OpenAiClient {
         messages: JSONArray,
         tools: JSONArray? = null,
         stream: Boolean = false,
-        onDelta: ((String) -> Unit)? = null
+        onDelta: ((String) -> Unit)? = null,
+        format: AiApiFormat = AiApiFormat.CHAT_COMPLETIONS
     ): Result<ChatResponse> = withContext(Dispatchers.IO) {
         var attempt = 0
         while (true) {
             attempt++
             var streamedAnything = false
             val wrappedDelta: (String) -> Unit = { text -> streamedAnything = true; onDelta?.invoke(text) }
-            val result = completeOnce(baseUrl, apiKey, model, messages, tools, stream, wrappedDelta) { streamedAnything = true }
+            val result = completeOnce(baseUrl, apiKey, model, messages, tools, stream, wrappedDelta, format) { streamedAnything = true }
             val error = result.exceptionOrNull()
             // 连接被代理/服务端掐断且还没收到任何内容：重试一次（请求本身幂等）
             if (error is java.io.IOException && !streamedAnything && attempt < MAX_ATTEMPTS && isActive) {
-                Log.w(TAG, "Request failed with ${error.javaClass.simpleName}: ${error.message}; retrying ($attempt/$MAX_ATTEMPTS)")
+                Log.w(TAG, "Request failed with ${error.javaClass.simpleName}; retrying ($attempt/$MAX_ATTEMPTS)")
                 kotlinx.coroutines.delay(600L * attempt)
                 continue
             }
@@ -181,6 +182,7 @@ object OpenAiClient {
         tools: JSONArray?,
         stream: Boolean,
         onDelta: ((String) -> Unit)?,
+        format: AiApiFormat,
         onStreamStarted: () -> Unit
     ): Result<ChatResponse> = withContext(Dispatchers.IO) {
         try {
@@ -191,10 +193,10 @@ object OpenAiClient {
                 return@withContext Result.failure(IllegalArgumentException("模型名称不能为空"))
             }
 
-            val targetUrl = normalizeUrl(baseUrl)
-            Log.d(TAG, "Requesting $targetUrl model=$model stream=$stream messages=${messages.length()} tools=${tools?.length() ?: 0}")
+            val targetUrl = AiProtocol.url(baseUrl, model, format, stream)
+            Log.d(TAG, "Request format=$format stream=$stream messages=${messages.length()} tools=${tools?.length() ?: 0}")
 
-            val requestJson = JSONObject().apply {
+            val requestJson = if (format != AiApiFormat.CHAT_COMPLETIONS) AiProtocol.request(model, messages, tools, format, stream) else JSONObject().apply {
                 put("model", model.trim())
                 put("messages", messages)
                 put("stream", stream)
@@ -211,8 +213,13 @@ object OpenAiClient {
                 .post(bodyText.toRequestBody(JSON_MEDIA_TYPE))
 
             if (apiKey.isNotBlank()) {
-                requestBuilder.header("Authorization", "Bearer ${apiKey.trim()}")
+                when (format) {
+                    AiApiFormat.CLAUDE -> requestBuilder.header("x-api-key", apiKey.trim())
+                    AiApiFormat.GEMINI -> requestBuilder.header("x-goog-api-key", apiKey.trim())
+                    else -> requestBuilder.header("Authorization", "Bearer ${apiKey.trim()}")
+                }
             }
+            if (format == AiApiFormat.CLAUDE) requestBuilder.header("anthropic-version", "2023-06-01")
             if (stream) {
                 requestBuilder.header("Accept", "text/event-stream")
             }
@@ -240,11 +247,19 @@ object OpenAiClient {
                 val contentType = body.contentType()?.toString() ?: ""
 
                 if (stream && contentType.contains("text/event-stream")) {
+                    if (format != AiApiFormat.CHAT_COMPLETIONS) {
+                        return@withContext Result.success(with(AiProtocol) { stream(body.source(), format, onDelta, onStreamStarted) })
+                    }
                     return@withContext Result.success(parseStream(body.source(), onDelta, onStreamStarted))
                 }
 
                 // 非流式（或服务端忽略了 stream 参数）
                 val json = JSONObject(readLimitedBody(body))
+                if (format != AiApiFormat.CHAT_COMPLETIONS) {
+                    val parsed = AiProtocol.response(json, format)
+                    if (parsed.content.isNotEmpty()) onDelta?.invoke(parsed.content)
+                    return@withContext Result.success(parsed)
+                }
                 val choices = json.optJSONArray("choices")
                 if (choices == null || choices.length() == 0) {
                     return@withContext Result.failure(Exception("API 返回结果为空 (无 choices)"))
@@ -365,12 +380,14 @@ object OpenAiClient {
     suspend fun testConnection(
         baseUrl: String,
         apiKey: String,
-        model: String
+        model: String,
+        format: AiApiFormat = AiApiFormat.CHAT_COMPLETIONS
     ): Result<String> = chatCompletion(
         baseUrl = baseUrl,
         apiKey = apiKey,
         model = model,
         systemPrompt = "You are a helpful assistant. Reply with: OK",
-        userMessage = "Ping test, please reply with OK"
+        userMessage = "Ping test, please reply with OK",
+        format = format
     )
 }

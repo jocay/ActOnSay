@@ -68,11 +68,12 @@ import java.net.URLDecoder
 @Composable
 fun TasksScreen() {
     val tasks by TaskRuntime.tasks.collectAsState()
+    val totalTasks by TaskRuntime.taskCount.collectAsState()
     val error by TaskRuntime.serviceError.collectAsState()
     var filter by rememberSaveable { mutableStateOf("work") }
     val visible = remember(tasks, filter) {
         tasks.filter { task -> when (filter) {
-            "active" -> task.state in setOf("QUEUED", "RUNNING", "WAITING_APP", "WAITING_CONFIRMATION", "RESULT_UNKNOWN")
+            "active" -> task.state in setOf("QUEUED", "RUNNING", "WAITING_APP", "WAITING_CONFIRMATION", "RESULT_UNKNOWN", "CANCELLING")
             "automation" -> task.source in setOf("automation", "script")
             "all" -> true
             else -> task.visible
@@ -95,6 +96,9 @@ fun TasksScreen() {
             } }
             if (visible.isEmpty()) item { Text(if (tasks.isEmpty()) "暂无任务。在对话中提交目标，或在自动化页创建计划。" else "当前筛选下没有任务。") }
             items(visible, key = { it.id }) { TaskCard(it) }
+            if (tasks.size < totalTasks) item(key = "load-more") {
+                TextButton(onClick = { TaskRuntime.loadMoreTasks() }) { Text("加载更早的任务") }
+            }
         }
     }
 }
@@ -108,6 +112,7 @@ fun taskStateLabel(state: String): String = when (state) {
     "FAILED" -> "失败"
     "CANCELLED" -> "已取消"
     "RESULT_UNKNOWN" -> "结果待确认"
+    "CANCELLING" -> "正在取消"
     else -> state
 }
 
@@ -154,11 +159,16 @@ fun TaskCard(task: TaskRecord, compact: Boolean = false) {
             Row {
                 TextButton(onClick = { expanded = !expanded }) { Text(if (expanded) "收起详情" else "日志与产物") }
                 if (canCancel) TextButton(onClick = { TaskRuntime.cancel(task.id) }) { Text("取消任务") }
+                // 取消请求可能没送达执行环境：允许立即再确认一次，不必等周期同步。
+                if (task.state == "CANCELLING") TextButton(onClick = { TaskRuntime.cancel(task.id) }) { Text("重新确认取消") }
+            }
+            if (task.state == "CANCELLING") {
+                Text("已请求停止，执行环境确认进程结束后才会显示为“已取消”。", style = MaterialTheme.typography.bodySmall)
             }
             if (!compact && task.source != "script" && task.state in setOf("WAITING_APP", "FAILED", "CANCELLED", "RESULT_UNKNOWN")) {
                 FilledTonalButton(onClick = { TaskRuntime.resume(task.id) }) { Text(if (task.state == "RESULT_UNKNOWN") "查询原调用并恢复" else "从检查点恢复") }
             }
-            if (!compact && !canCancel) TextButton(onClick = { confirmRerun = true }) { Text("显式重跑") }
+            if (!compact && !canCancel && task.state != "CANCELLING") TextButton(onClick = { confirmRerun = true }) { Text("显式重跑") }
             if (task.state == "RESULT_UNKNOWN") {
                 Text("已有操作的结果无法确认。请核实设备或执行环境；应用不会自动重放该操作。", style = MaterialTheme.typography.bodySmall)
                 if (!compact) TextButton(onClick = { resolveDialog = true }) { Text("人工核实结果") }

@@ -22,6 +22,8 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -84,6 +86,10 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.snapshotFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.collect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -99,8 +105,12 @@ import com.voice.actonsay.asr.AsrService
 import com.voice.actonsay.asr.AsrState
 import com.voice.actonsay.asr.ChatMessage
 import com.voice.actonsay.asr.EngineState
-import com.voice.actonsay.tts.TtsManager
+import com.voice.actonsay.tasks.ConversationRecord
 import com.voice.actonsay.tasks.CredentialRedactor
+import com.voice.actonsay.tasks.MessageSearchHit
+import com.voice.actonsay.tasks.TaskRecord
+import com.voice.actonsay.tasks.TaskRuntime
+import kotlinx.coroutines.delay
 import com.voice.actonsay.ui.components.ChatBubble
 import com.voice.actonsay.ui.components.LevelBars
 import com.voice.actonsay.ui.components.VoiceOrb
@@ -130,11 +140,26 @@ fun HomeScreen(
     val context = LocalContext.current
     val asrState by AsrManager.state.collectAsState()
     val audioLevel by AsrManager.audioLevel.collectAsState()
+    val conversations by AsrManager.conversations.collectAsState()
+    val tasks by TaskRuntime.tasks.collectAsState()
+    val pendingTurns = remember(tasks, asrState.conversationId) { AsrManager.pendingTurns(tasks) }
+    val conversationTitle = conversations.firstOrNull { it.id == asrState.conversationId }?.title ?: "新对话"
 
     var manualInputText by rememberSaveable { mutableStateOf("") }
     var showClearDialog by remember { mutableStateOf(false) }
+    var showConversations by remember { mutableStateOf(false) }
     var menuOpen by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
+    val scrollScope = rememberCoroutineScope()
+    var followLatest by remember { mutableStateOf(true) }
+    var autoScrolling by remember { mutableStateOf(false) }
+    var hasNewContent by remember { mutableStateOf(false) }
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isScrollInProgress to listState.canScrollForward }.collect { (scrolling, canForward) ->
+            if (scrolling && !autoScrolling) followLatest = !canForward
+            if (!canForward) { followLatest = true; hasNewContent = false }
+        }
+    }
 
     var hasAudioPermission by remember {
         mutableStateOf(
@@ -171,14 +196,19 @@ fun HomeScreen(
 
     // 自动滚动到底部（新消息或流式内容增长时）
     val lastMessage = asrState.messages.lastOrNull()
-    LaunchedEffect(asrState.messages.size, lastMessage?.content?.length) {
-        if (asrState.messages.isNotEmpty()) {
-            listState.animateScrollToItem(asrState.messages.size - 1 + 1) // +1 为顶部 header 项
+    LaunchedEffect(asrState.messages.size, lastMessage?.id, lastMessage?.content) {
+        if (asrState.messages.isNotEmpty() && followLatest) {
+            autoScrolling = true
+            try { listState.scrollToItem(asrState.messages.size + 1) }
+            finally { autoScrolling = false }
+        } else if (asrState.messages.isNotEmpty()) {
+            hasNewContent = true
         }
     }
 
     fun sendManual() {
         if (manualInputText.isNotBlank()) {
+            followLatest = true
             AsrManager.sendManualMessage(manualInputText.trim())
             manualInputText = ""
         }
@@ -211,8 +241,8 @@ fun HomeScreen(
         AlertDialog(
             onDismissRequest = { showClearDialog = false },
             icon = { Icon(Icons.Default.Delete, null) },
-            title = { Text("清空对话记录？") },
-            text = { Text("将删除本机保存的全部对话内容，此操作不可撤销。") },
+            title = { Text("清空当前对话？") },
+            text = { Text("将删除「$conversationTitle」中的全部消息，其他会话不受影响，此操作不可撤销。") },
             confirmButton = {
                 TextButton(onClick = { AsrManager.clearMessages(); showClearDialog = false }) {
                     Text("清空", color = MaterialTheme.colorScheme.error)
@@ -222,12 +252,21 @@ fun HomeScreen(
         )
     }
 
+    if (showConversations) ConversationsDialog(
+        current = asrState.conversationId,
+        conversations = conversations,
+        onDismiss = { showConversations = false },
+        onOpen = { id -> AsrManager.switchConversation(id); showConversations = false },
+        onNew = { AsrManager.newConversation(); showConversations = false },
+        onDelete = { AsrManager.deleteConversation(it) }
+    )
+
     Scaffold(
         topBar = {
             TopAppBar(
                 title = {
-                    Column {
-                        Text("ActOnSay", style = MaterialTheme.typography.titleLarge)
+                    Column(Modifier.clip(RoundedCornerShape(8.dp)).clickable { showConversations = true }) {
+                        Text(conversationTitle, style = MaterialTheme.typography.titleLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         Text(
                             text = standbySubtitle(asrState),
                             style = MaterialTheme.typography.bodySmall,
@@ -246,6 +285,17 @@ fun HomeScreen(
                         }
                         DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                             DropdownMenuItem(
+                                text = { Text("新建对话") },
+                                leadingIcon = { Icon(AppIcons.Chat, null) },
+                                enabled = asrState.messages.isNotEmpty(),
+                                onClick = { menuOpen = false; AsrManager.newConversation() }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("会话列表与搜索") },
+                                leadingIcon = { Icon(AppIcons.History, null) },
+                                onClick = { menuOpen = false; showConversations = true }
+                            )
+                            DropdownMenuItem(
                                 text = { Text("设置") },
                                 leadingIcon = { Icon(Icons.Default.Settings, null) },
                                 onClick = { menuOpen = false; onOpenSettings() }
@@ -257,7 +307,7 @@ fun HomeScreen(
                                 onClick = { menuOpen = false; exportConversation() }
                             )
                             DropdownMenuItem(
-                                text = { Text("清空对话") },
+                                text = { Text("清空当前对话") },
                                 leadingIcon = { Icon(Icons.Default.Delete, null) },
                                 enabled = asrState.messages.isNotEmpty(),
                                 onClick = { menuOpen = false; showClearDialog = true }
@@ -289,9 +339,20 @@ fun HomeScreen(
             StatusBanner(
                 state = asrState,
                 audioLevel = audioLevel,
-                onInterrupt = { AsrManager.stopTts() },
+                taskActive = pendingTurns.any { it.state == "RUNNING" },
+                onStopSpeaking = { AsrManager.stopTts() },
+                onStopTask = { AsrManager.stopCurrentTask() },
                 onCancelAi = { AsrManager.cancelAi() }
             )
+
+            // 有排队的请求时显示队列，每一项都能单独取消。
+            AnimatedVisibility(
+                visible = pendingTurns.size > 1 || pendingTurns.any { it.state == "QUEUED" },
+                enter = expandVertically() + fadeIn(),
+                exit = shrinkVertically() + fadeOut()
+            ) {
+                QueueStrip(pendingTurns)
+            }
 
             AnimatedVisibility(
                 visible = asrState.errorMessage.isNotEmpty(),
@@ -344,7 +405,7 @@ fun HomeScreen(
                         } else null
                         ChatBubble(
                             message = msg,
-                            onReplayTts = { TtsManager.speak(if (msg.content.length > 400) msg.content.take(400) + "。完整内容请查看屏幕。" else msg.content) },
+                            onReplayTts = { AsrManager.replayMessage(msg.content) },
                             onCopyText = { copy(msg.content) },
                             onShare = { share(msg.content) },
                             onDelete = { AsrManager.deleteMessage(msg.id) },
@@ -359,6 +420,17 @@ fun HomeScreen(
                     }
                     item(key = "bottom-space") { Spacer(Modifier.height(4.dp)) }
                 }
+                if (hasNewContent) {
+                    TextButton(onClick = {
+                        followLatest = true
+                        hasNewContent = false
+                        scrollScope.launch {
+                            autoScrolling = true
+                            try { listState.animateScrollToItem(asrState.messages.size + 1) }
+                            finally { autoScrolling = false }
+                        }
+                    }, modifier = Modifier.align(Alignment.CenterHorizontally)) { Text("有新内容 · 回到最新消息") }
+                }
             }
         }
     }
@@ -366,7 +438,7 @@ fun HomeScreen(
 
 private fun standbySubtitle(state: AsrState): String = when (state.engineState) {
     EngineState.IDLE -> "语音待机已关闭"
-    EngineState.WAITING_WAKEWORD -> {
+    EngineState.WAITING_WAKEWORD -> if (!state.voiceReady) "语音模型准备中，可先文字输入" else {
         val words = state.customWakeWords.joinToString("、")
         if (words.isBlank()) "待机中" else "待机中 · 呼叫「$words」"
     }
@@ -406,19 +478,24 @@ private fun StandbyToggle(listening: Boolean, onToggle: () -> Unit) {
 private fun StatusBanner(
     state: AsrState,
     audioLevel: Float,
-    onInterrupt: () -> Unit,
+    taskActive: Boolean,
+    onStopSpeaking: () -> Unit,
+    onStopTask: () -> Unit,
     onCancelAi: () -> Unit
 ) {
     val accent = engineStateColor(state.engineState)
     val bg by animateColorAsState(accent.copy(alpha = if (state.engineState == EngineState.IDLE) 0.06f else 0.12f), label = "bannerBg")
+    val interruptWord = state.interruptWords.firstOrNull()
 
     val (title, detail) = when (state.engineState) {
         EngineState.IDLE -> "待机已关闭" to "点击右上角或底部麦克风开启语音待机"
-        EngineState.WAITING_WAKEWORD -> "正在等待唤醒" to "说出唤醒词，或点击底部麦克风直接说话"
+        EngineState.WAITING_WAKEWORD -> if (!state.voiceReady) "语音模型准备中" to "唤醒词与断句模型正在加载，文字对话可直接使用"
+            else if (taskActive) "AI 正在处理" to (if (interruptWord != null) "说「$interruptWord」可让我停下来听你说，任务继续执行" else "可继续说话或输入，新消息会排队")
+            else "正在等待唤醒" to "说出唤醒词，或点击底部麦克风直接说话"
         EngineState.ACTIVE_LISTENING -> "我在听，请说" to (if (state.lastWakeWord.isNotBlank()) "由「${state.lastWakeWord}」唤醒 · 停顿后自动结束" else "停顿后自动结束")
         EngineState.PROCESSING_FINAL -> "正在识别" to "等待云端返回最终文本"
         EngineState.THINKING_AI -> (if (state.agentActivity.isNotBlank()) "正在执行任务" else "AI 正在思考") to state.agentActivity.ifBlank { "模型 ${state.aiModel}" }
-        EngineState.SPEAKING_TTS -> "正在播报" to "播报期间暂停拾音，防止回声"
+        EngineState.SPEAKING_TTS -> "正在播报" to (if (interruptWord != null) "说「$interruptWord」停止朗读并继续听你说" else "可点“停止朗读”")
     }
 
     Surface(
@@ -461,14 +538,25 @@ private fun StatusBanner(
                     level = audioLevel, active = true, color = accent,
                     modifier = Modifier.size(width = 36.dp, height = 22.dp)
                 )
-                EngineState.SPEAKING_TTS -> FilledTonalButton(
-                    onClick = onInterrupt,
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
-                ) {
-                    Icon(AppIcons.Stop, null, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text("打断")
+                // “停止朗读”只让声音停下，任务继续；“停止任务”取消正在执行的回合。
+                EngineState.SPEAKING_TTS -> Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    if (taskActive) TextButton(
+                        onClick = onStopTask,
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                    ) { Text("停止任务") }
+                    FilledTonalButton(
+                        onClick = onStopSpeaking,
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+                    ) {
+                        Icon(AppIcons.Stop, null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("停止朗读")
+                    }
                 }
+                EngineState.WAITING_WAKEWORD -> if (taskActive) TextButton(
+                    onClick = onStopTask,
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                ) { Text("停止任务") }
                 EngineState.THINKING_AI -> TextButton(
                     onClick = onCancelAi,
                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
@@ -784,4 +872,122 @@ private fun ComposerBar(
             )
         }
     }
+}
+
+/** 当前会话中正在执行和排队的请求，每项可单独停止或取消。 */
+@Composable
+private fun QueueStrip(turns: List<TaskRecord>) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+        shape = RoundedCornerShape(16.dp),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)
+    ) {
+        Column(Modifier.padding(horizontal = 14.dp, vertical = 8.dp)) {
+            Text("请求队列", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+            turns.forEach { task ->
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        when (task.state) { "RUNNING" -> "执行中"; "WAITING_CONFIRMATION" -> "待确认"; else -> "排队" },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.width(44.dp)
+                    )
+                    Text(
+                        task.goal.lineSequence().firstOrNull().orEmpty(),
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    TextButton(
+                        onClick = { TaskRuntime.cancel(task.id) },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                    ) { Text(if (task.state == "QUEUED") "取消" else "停止") }
+                }
+            }
+        }
+    }
+}
+
+/** 会话列表：切换、新建、删除，以及按内容搜索全部会话。 */
+@Composable
+private fun ConversationsDialog(
+    current: String,
+    conversations: List<ConversationRecord>,
+    onDismiss: () -> Unit,
+    onOpen: (String) -> Unit,
+    onNew: () -> Unit,
+    onDelete: (String) -> Unit
+) {
+    var query by rememberSaveable { mutableStateOf("") }
+    var hits by remember { mutableStateOf(emptyList<MessageSearchHit>()) }
+    var deleting by remember { mutableStateOf<ConversationRecord?>(null) }
+    val format = remember { SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()) }
+    LaunchedEffect(query) {
+        if (query.isBlank()) { hits = emptyList(); return@LaunchedEffect }
+        delay(300)
+        hits = AsrManager.searchMessages(query)
+    }
+    deleting?.let { target ->
+        AlertDialog(
+            onDismissRequest = { deleting = null },
+            title = { Text("删除这个会话？") },
+            text = { Text("「${target.title}」的消息将被删除，相关任务记录仍保留在任务页。") },
+            confirmButton = { TextButton(onClick = { onDelete(target.id); deleting = null }) { Text("删除", color = MaterialTheme.colorScheme.error) } },
+            dismissButton = { TextButton(onClick = { deleting = null }) { Text("取消") } }
+        )
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("会话") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = query,
+                    onValueChange = { query = it },
+                    placeholder = { Text("搜索全部会话的消息") },
+                    singleLine = true,
+                    shape = CircleShape,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                LazyColumn(Modifier.heightIn(max = 420.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    if (query.isNotBlank()) {
+                        if (hits.isEmpty()) item { Text("没有找到相关消息", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(8.dp)) }
+                        items(hits, key = { "hit-" + it.message.id }) { hit ->
+                            Surface(onClick = { onOpen(hit.conversationId) }, color = Color.Transparent, shape = RoundedCornerShape(12.dp)) {
+                                Column(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp)) {
+                                    Text("${hit.conversationTitle} · ${format.format(Date(hit.message.timestamp))}",
+                                        style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                                    Text(hit.message.content, style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                }
+                            }
+                        }
+                    } else {
+                        items(conversations, key = { it.id }) { conversation ->
+                            val selected = conversation.id == current
+                            Surface(
+                                onClick = { onOpen(conversation.id) },
+                                color = if (selected) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent,
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Row(Modifier.fillMaxWidth().padding(start = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    Column(Modifier.weight(1f).padding(vertical = 6.dp)) {
+                                        Text(conversation.title, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                        Text(format.format(Date(conversation.updatedAt)), style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                    IconButton(onClick = { deleting = conversation }) {
+                                        Icon(Icons.Default.Delete, "删除会话", modifier = Modifier.size(18.dp))
+                                    }
+                                }
+                            }
+                        }
+                        if (conversations.isEmpty()) item { Text("还没有保存的会话", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(8.dp)) }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onNew) { Text("新建对话") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("关闭") } }
+    )
 }

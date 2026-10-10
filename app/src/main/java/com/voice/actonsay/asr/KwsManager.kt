@@ -22,13 +22,15 @@ class KwsManager {
     private var interruptStream: OnlineStream? = null
     private var currentInterruptWords: Set<String> = emptySet()
 
-    @Synchronized
+    /**
+     * 在后台线程调用：模型加载耗时较长，放在锁外进行，加载期间主线程调用 [reset] 等方法不会被阻塞。
+     */
     fun init(assetManager: AssetManager) {
-        if (spotter != null) return
+        if (synchronized(this) { spotter != null }) return
 
         PinyinHelper.init(assetManager)
 
-        try {
+        val created = try {
             val modelConfig = OnlineModelConfig().apply {
                 transducer = OnlineTransducerModelConfig(
                     encoder = "encoder.int8.onnx",
@@ -50,13 +52,18 @@ class KwsManager {
                 numTrailingBlanks = 2
             )
 
-            spotter = KeywordSpotter(assetManager = assetManager, config = config)
-            recreateStream()
-            updateInterruptWords(currentInterruptWords)
-            Log.i(TAG, "Sherpa-onnx KWS engine initialized successfully")
+            KeywordSpotter(assetManager = assetManager, config = config)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to initialize KWS engine", e)
+            return
         }
+        synchronized(this) {
+            if (spotter != null) { created.release(); return }
+            spotter = created
+            recreateStream()
+            updateInterruptWords(currentInterruptWords)
+        }
+        Log.i(TAG, "Sherpa-onnx KWS engine initialized successfully")
     }
 
     @Synchronized

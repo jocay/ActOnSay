@@ -4,6 +4,11 @@ import android.util.Base64
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -87,7 +92,11 @@ object MimoTtsClient {
 
             Log.d(TAG, "Requesting MiMo TTS: voice=$voice, format=$format, textLength=${trimmed.length}")
 
-            client.newCall(request).execute().use { response ->
+            val call = client.newCall(request)
+            val cancelWatcher = launch(start = CoroutineStart.UNDISPATCHED) {
+                try { awaitCancellation() } finally { call.cancel() }
+            }
+            try { call.execute().use { response ->
                 val bodyString = response.body?.string() ?: ""
                 if (!response.isSuccessful) {
                     val errMsg = try {
@@ -119,8 +128,11 @@ object MimoTtsClient {
                 val audioBytes = Base64.decode(base64Data, Base64.DEFAULT)
                 Log.d(TAG, "MiMo TTS synthesis succeeded, audio bytes size: ${audioBytes.size}")
                 Result.success(audioBytes)
-            }
+            } } finally { cancelWatcher.cancel() }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
+            if (!isActive) throw CancellationException("synthesis cancelled", e)
             Log.e(TAG, "MiMo TTS synthesis error", e)
             Result.failure(e)
         }

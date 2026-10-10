@@ -26,6 +26,26 @@ if ! command -v systemctl >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then
   exit 1
 fi
 
+# 容器配置的代理连不上时，本次安装改为直连；只影响本脚本进程，不修改容器原有的代理设置。
+configured_proxy="${https_proxy:-${HTTPS_PROXY:-${http_proxy:-${HTTP_PROXY:-}}}}"
+if [ -n "$configured_proxy" ] && command -v python3 >/dev/null 2>&1; then
+  if ! python3 - "$configured_proxy" <<'PY'
+import socket
+import sys
+import urllib.parse
+value = sys.argv[1] if "://" in sys.argv[1] else "http://" + sys.argv[1]
+target = urllib.parse.urlsplit(value)
+try:
+    socket.create_connection((target.hostname, target.port or 80), timeout=5).close()
+except (OSError, TypeError, ValueError):
+    sys.exit(1)
+PY
+  then
+    printf 'Configured proxy is unreachable; installing without it.\n'
+    unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
+  fi
+fi
+
 # 仅在缺少系统依赖时访问软件源，重复升级不因软件源暂时不可用而失败。
 need_packages=0
 command -v python3 >/dev/null 2>&1 || need_packages=1
@@ -48,7 +68,14 @@ if [ -d "$source_dir/skills" ]; then
   cp -a "$source_dir/skills" "$release_dir/"
 fi
 python3 -m venv "$release_dir/venv"
-"$release_dir/venv/bin/python" -m pip install --disable-pip-version-check -r "$release_dir/requirements.txt"
+pip_install() {
+  "$release_dir/venv/bin/python" -m pip install --disable-pip-version-check --timeout 30 "$@" -r "$release_dir/requirements.txt"
+}
+# 官方源不可用时改用国内镜像再试一次。
+if ! pip_install; then
+  printf 'PyPI is unavailable; retrying with the Aliyun mirror.\n'
+  pip_install --index-url https://mirrors.aliyun.com/pypi/simple/
+fi
 
 # 配对令牌从不写入安装输出，重复部署保留原值。
 if [ ! -f "$config_dir/token" ]; then

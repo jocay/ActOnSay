@@ -52,4 +52,13 @@ internal object TaskSecretVault {
         }
         return cipher.doFinal(bytes.copyOfRange(12, bytes.size)).toString(Charsets.UTF_8)
     }
+
+    /** 仅在用户清理历史时回收旧的无引用大载荷；新写入但还未提交的文件不触碰。 */
+    fun pruneUnreferenced(references: List<String>, before: Long) {
+        val retained = references.filter { it.startsWith("vault-file:") }.map { it.removePrefix("vault-file:") }.toSet()
+        val root = directory.canonicalFile
+        root.listFiles()?.forEach { file ->
+            if (file.name !in retained && file.lastModified() < before && file.canonicalFile == file.absoluteFile && file.isFile) file.delete()
+        }
+    }
 }

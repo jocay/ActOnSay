@@ -123,9 +123,9 @@ object ToolRegistry {
     @Synchronized fun register(tool: AgentTool) { tools[tool.name] = tool }
     @Synchronized fun get(name: String): AgentTool? = tools[name]
     @Synchronized fun all(): List<AgentTool> = tools.values.toList()
-    @Synchronized fun removePrefix(prefix: String) { tools.keys.removeAll { it.startsWith(prefix) } }
-    fun toOpenAiTools(): JSONArray = JSONArray().apply {
-        all().forEach { tool -> put(JSONObject().put("type", "function").put("function", JSONObject()
+    /** 内置工具加上本任务固定的扩展工具（MCP 快照），扩展工具不进入全局注册表。 */
+    fun toOpenAiTools(extra: Collection<AgentTool> = emptyList()): JSONArray = JSONArray().apply {
+        (all() + extra.filter { get(it.name) == null }).forEach { tool -> put(JSONObject().put("type", "function").put("function", JSONObject()
             .put("name", tool.name).put("description", tool.description).put("parameters", tool.parameters))) }
     }
 }

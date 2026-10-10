@@ -107,10 +107,13 @@ class DebianExecutionTool : AgentTool {
     }
 }
 
+/** 任务开始时固定的扩展目录：摘要写进提示词，MCP 工具只在本任务内可见，其他任务刷新目录不会影响它。 */
+class ExtensionCatalog(val summary: String, val tools: Map<String, AgentTool>)
+
 /** 每个任务只加载扩展目录；Skill 正文通过 read_skill 按需加载。 */
 object BridgeExtensionCatalog {
-    suspend fun prepare(taskId: String): String {
-        ToolRegistry.removePrefix("mcp__")
+    suspend fun prepare(taskId: String): ExtensionCatalog {
+        val snapshot = LinkedHashMap<String, AgentTool>()
         val summary = StringBuilder("Linux自动化使用 run_debian；任务产物写入 ACTONSAY_ARTIFACT_DIR。\n")
         runCatching {
             val services = BridgeClient.request("GET", "/v1/mcp").optJSONArray("servers") ?: JSONArray()
@@ -122,8 +125,9 @@ object BridgeExtensionCatalog {
                     val tools = BridgeClient.request("GET", "/v1/mcp/${pathSegment(id)}/tools").optJSONArray("tools") ?: JSONArray()
                     for (toolIndex in 0 until tools.length()) {
                         val tool = tools.getJSONObject(toolIndex)
-                        ToolRegistry.register(McpBridgeTool(id, tool.getString("name"), tool.optString("qualified_name"),
-                            tool.optString("description"), tool.optJSONObject("inputSchema") ?: schemaObject()))
+                        val bridged = McpBridgeTool(id, tool.getString("name"), tool.optString("qualified_name"),
+                            tool.optString("description"), tool.optJSONObject("inputSchema") ?: schemaObject())
+                        snapshot[bridged.name] = bridged
                     }
                 }
                 summary.append("MCP服务：").append(id).append("，工具可用mcp_tool查询并调用，资源和提示可按需查询。\n")
@@ -138,7 +142,7 @@ object BridgeExtensionCatalog {
                     .append(skill.optString("name")).append(": ").append(skill.optString("description").take(1000)).append('\n')
             }
         }
-        return summary.toString()
+        return ExtensionCatalog(summary.toString(), snapshot)
     }
 }
 

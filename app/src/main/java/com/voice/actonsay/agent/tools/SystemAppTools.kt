@@ -11,6 +11,7 @@ import android.provider.ContactsContract
 import android.telephony.SmsManager
 import com.voice.actonsay.agent.AgentTool
 import com.voice.actonsay.agent.NotificationReader
+import com.voice.actonsay.agent.SystemPermissions
 import com.voice.actonsay.agent.ToolContext
 import com.voice.actonsay.agent.ToolResult
 import com.voice.actonsay.agent.schemaObject
@@ -143,6 +144,7 @@ class AddCalendarEventTool : AgentTool {
         required = listOf("title", "start")
     )
     override suspend fun execute(args: JSONObject, ctx: ToolContext): ToolResult = withContext(Dispatchers.IO) {
+        SystemPermissions.check(ctx.context, SystemPermissions.CALENDAR)?.let { return@withContext it }
         val start = runCatching { LocalCalendar.parse(args.getString("start")) }.getOrElse { return@withContext ToolResult.failure("开始时间格式不对", "INVALID_ARGUMENT") }
         val end = args.optString("end").takeIf { it.isNotBlank() }?.let { runCatching { LocalCalendar.parse(it) }.getOrNull() } ?: (start + 3_600_000)
         ctx.onProgress("添加日程")
@@ -167,6 +169,7 @@ class ListCalendarEventsTool : AgentTool {
     override val description = "查看手机日历里未来若干天的日程。"
     override val parameters = schemaObject("days" to schemaProp("integer", "未来几天，默认 7，最多 60", default = 7))
     override suspend fun execute(args: JSONObject, ctx: ToolContext): ToolResult = withContext(Dispatchers.IO) {
+        SystemPermissions.check(ctx.context, SystemPermissions.CALENDAR)?.let { return@withContext it }
         val now = System.currentTimeMillis()
         val until = now + args.optInt("days", 7).coerceIn(1, 60) * 86_400_000L
         val uri = CalendarContract.Instances.CONTENT_URI.buildUpon().also { ContentUris.appendId(it, now); ContentUris.appendId(it, until) }.build()
@@ -183,10 +186,14 @@ class ListCalendarEventsTool : AgentTool {
     }
 }
 
+private fun looksLikeNumber(target: String): Boolean {
+    val digits = target.filter { it.isDigit() || it == '+' }
+    return digits.length >= 3 && digits.length >= target.count { !it.isWhitespace() } - 1
+}
+
 /** 按姓名查联系人号码；没有匹配时原样当作号码。 */
 private fun resolveNumber(context: Context, target: String): Pair<String, String>? {
-    val digits = target.filter { it.isDigit() || it == '+' }
-    if (digits.length >= 3 && digits.length >= target.count { !it.isWhitespace() } - 1) return target to digits
+    if (looksLikeNumber(target)) return target to target.filter { it.isDigit() || it == '+' }
     val uri = Uri.withAppendedPath(ContactsContract.CommonDataKinds.Phone.CONTENT_FILTER_URI, Uri.encode(target))
     context.contentResolver.query(uri, arrayOf(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME, ContactsContract.CommonDataKinds.Phone.NUMBER),
         null, null, null)?.use { if (it.moveToFirst()) return it.getString(0) to it.getString(1) }
@@ -198,6 +205,7 @@ class FindContactTool : AgentTool {
     override val description = "在手机通讯录里按姓名查找联系人及号码。"
     override val parameters = schemaObject("name" to schemaProp("string", "姓名或部分姓名"), required = listOf("name"))
     override suspend fun execute(args: JSONObject, ctx: ToolContext): ToolResult = withContext(Dispatchers.IO) {
+        SystemPermissions.check(ctx.context, SystemPermissions.CONTACTS)?.let { return@withContext it }
         val uri = Uri.withAppendedPath(ContactsContract.CommonDataKinds.Phone.CONTENT_FILTER_URI, Uri.encode(args.getString("name")))
         val lines = mutableListOf<String>()
         ctx.context.contentResolver.query(uri, arrayOf(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME, ContactsContract.CommonDataKinds.Phone.NUMBER),
@@ -205,6 +213,11 @@ class FindContactTool : AgentTool {
         ToolResult.success(if (lines.isEmpty()) "通讯录里没有找到“${args.getString("name")}”" else lines.distinct().joinToString("\n"))
     }
 }
+
+/** 拨号或发短信需要的系统权限：按姓名查找时还需要通讯录。 */
+private fun phonePermissions(context: Context, target: String, action: SystemPermissions.Group): ToolResult? =
+    if (looksLikeNumber(target)) SystemPermissions.check(context, action)
+    else SystemPermissions.check(context, action, SystemPermissions.CONTACTS)
 
 /** 打电话、发短信默认每次都要在界面确认，模型和语音都不能代替这一步。 */
 private suspend fun confirmPhoneAction(ctx: ToolContext) {
@@ -216,6 +229,7 @@ class CallPhoneTool : AgentTool {
     override val description = "拨打电话（联系人姓名或号码）。默认需要用户在界面确认后才会拨出；拨打前先用一句话告诉用户要打给谁。"
     override val parameters = schemaObject("target" to schemaProp("string", "联系人姓名或电话号码"), required = listOf("target"))
     override suspend fun execute(args: JSONObject, ctx: ToolContext): ToolResult {
+        phonePermissions(ctx.context, args.getString("target"), SystemPermissions.PHONE)?.let { return it }
         val (name, number) = withContext(Dispatchers.IO) { resolveNumber(ctx.context, args.getString("target")) }
             ?: return ToolResult.failure("通讯录里没有找到“${args.getString("target")}”", "CONTACT_NOT_FOUND")
         confirmPhoneAction(ctx)
@@ -238,6 +252,7 @@ class SendSmsTool : AgentTool {
     override suspend fun execute(args: JSONObject, ctx: ToolContext): ToolResult {
         val text = args.getString("text").trim()
         if (text.isEmpty()) return ToolResult.failure("短信内容不能为空", "INVALID_ARGUMENT")
+        phonePermissions(ctx.context, args.getString("target"), SystemPermissions.SMS)?.let { return it }
         val (name, number) = withContext(Dispatchers.IO) { resolveNumber(ctx.context, args.getString("target")) }
             ?: return ToolResult.failure("通讯录里没有找到“${args.getString("target")}”", "CONTACT_NOT_FOUND")
         confirmPhoneAction(ctx)

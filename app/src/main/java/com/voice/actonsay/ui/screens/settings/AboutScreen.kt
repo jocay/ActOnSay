@@ -23,12 +23,14 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -38,6 +40,11 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.voice.actonsay.asr.AsrManager
+import com.voice.actonsay.tasks.TaskRuntime
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.CancellationException
 import com.voice.actonsay.ui.components.SectionCard
 import com.voice.actonsay.ui.components.SettingNavRow
 import com.voice.actonsay.ui.icons.AppIcons
@@ -50,6 +57,34 @@ fun AboutScreen(onBack: () -> Unit) {
         runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }.getOrNull() ?: "1.0"
     }
     var confirm by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    var cleanupDays by remember { mutableStateOf(30) }
+    var confirmCleanup by remember { mutableStateOf(false) }
+    var cleaning by remember { mutableStateOf(false) }
+    var cleanupMessage by remember { mutableStateOf("") }
+
+    if (confirmCleanup) AlertDialog(
+        onDismissRequest = { confirmCleanup = false },
+        title = { Text("清理 $cleanupDays 天前的已结束任务？") },
+        text = { Text("删除这些任务的本机记录、工具日志、检查点和图片，无法撤销。保留未结束、结果待确认、聊天仍引用的任务及 Debian 同步记录；不会删除容器中的数据。") },
+        confirmButton = {
+            TextButton(onClick = {
+                confirmCleanup = false
+                cleaning = true
+                scope.launch {
+                    try {
+                        val count = withContext(Dispatchers.IO) { TaskRuntime.clearFinishedHistory(cleanupDays) }
+                        cleanupMessage = "已清理 $count 个任务；受保护的记录已保留。"
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (_: Exception) {
+                        cleanupMessage = "清理未全部完成，可稍后重试。"
+                    } finally { cleaning = false }
+                }
+            }) { Text("清理", color = MaterialTheme.colorScheme.error) }
+        },
+        dismissButton = { TextButton(onClick = { confirmCleanup = false }) { Text("取消") } }
+    )
 
     confirm?.let { which ->
         AlertDialog(
@@ -64,7 +99,7 @@ fun AboutScreen(onBack: () -> Unit) {
             confirmButton = {
                 TextButton(onClick = {
                     if (which == "history") {
-                        AsrManager.clearMessages()
+                        AsrManager.clearAllConversations()
                         AsrManager.keywordDetector.clearEvents()
                     } else {
                         AsrManager.resetAllSettings()
@@ -125,6 +160,20 @@ fun AboutScreen(onBack: () -> Unit) {
         }
 
         SectionCard(title = "数据管理") {
+            Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
+                Text("清理已结束任务", style = MaterialTheme.typography.titleSmall)
+                Text("保留最近的记录，不自动删除历史。", style = MaterialTheme.typography.bodySmall)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf(7, 30, 90).forEach { days ->
+                        FilterChip(selected = cleanupDays == days, onClick = { cleanupDays = days },
+                            enabled = !cleaning, label = { Text("$days 天") })
+                    }
+                }
+                TextButton(enabled = !cleaning, onClick = { confirmCleanup = true }) {
+                    Text(if (cleaning) "正在清理…" else "清理更早的已结束任务")
+                }
+                if (cleanupMessage.isNotBlank()) Text(cleanupMessage, style = MaterialTheme.typography.bodySmall)
+            }
             SettingNavRow(
                 title = "导出配置（已脱敏）",
                 subtitle = "凭据只显示是否已配置，可用于排查与备份设置说明",

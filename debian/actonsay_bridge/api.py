@@ -169,7 +169,7 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @router.get("/health")
     async def health():
-        return {"status": "ready", "version": __version__, "identity": {"uid": os.getuid(), "gid": os.getgid(), "user": getpass.getuser(), "root": os.getuid() == 0}, "shared_mounts": shared_mounts(), "timezone": config.timezone, "time": now(), "data_dir": str(config.data_dir), "python": sys.executable, "automation": app.state.schedules.automation(), "capabilities": ["executions", "events", "schedules", "ai_triggers", "mcp_stdio", "mcp_streamable_http", "skills"]}
+        return {"status": "ready", "version": __version__, "identity": {"uid": os.getuid(), "gid": os.getgid(), "user": getpass.getuser(), "root": os.getuid() == 0}, "shared_mounts": shared_mounts(), "timezone": config.timezone, "time": now(), "data_dir": str(config.data_dir), "python": sys.executable, "automation": app.state.schedules.automation(), "capabilities": ["executions", "events", "schedules", "schedule_preview", "ai_triggers", "mcp_stdio", "mcp_streamable_http", "skills"]}
 
     @router.post("/executions", status_code=202)
     async def submit_execution(data: dict = Body(...)):
@@ -277,6 +277,10 @@ def create_app(config: Config | None = None) -> FastAPI:
     @router.post("/schedules", status_code=201)
     async def create_schedule(data: dict = Body(...)):
         return app.state.schedules.save(data)
+
+    @router.post("/schedules/preview")
+    async def preview_schedule(data: dict = Body(...)):
+        return app.state.schedules.preview(data, int(data.get("count", 5)))
 
     @router.get("/schedules/{schedule_id}")
     async def get_schedule(schedule_id: str):
