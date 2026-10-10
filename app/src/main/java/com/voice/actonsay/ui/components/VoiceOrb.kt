@@ -47,27 +47,29 @@ fun VoiceOrb(
     icon: ImageVector? = null
 ) {
     val accent by animateColorAsState(engineStateColor(state), tween(400), label = "orbColor")
-    val level by animateFloatAsState(
+    val active = state != EngineState.IDLE
+    val spinning = state == EngineState.THINKING_AI || state == EngineState.PROCESSING_FINAL
+    val levelState = animateFloatAsState(
         targetValue = if (state == EngineState.ACTIVE_LISTENING) audioLevel else 0f,
         animationSpec = spring(stiffness = 600f, dampingRatio = 0.6f),
         label = "orbLevel"
     )
 
-    val transition = rememberInfiniteTransition(label = "orbBreath")
-    val breath by transition.animateFloat(
+    val transition = if (active) rememberInfiniteTransition(label = "orbBreath") else null
+    val breathState = transition?.animateFloat(
         initialValue = 0f,
         targetValue = 1f,
         animationSpec = infiniteRepeatable(tween(2400, easing = LinearEasing), RepeatMode.Restart),
         label = "breath"
     )
-    val spin by transition.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(tween(6000, easing = LinearEasing), RepeatMode.Restart),
-        label = "spin"
-    )
-
-    val active = state != EngineState.IDLE
+    val spinState = if (transition != null && spinning) {
+        transition.animateFloat(
+            initialValue = 0f,
+            targetValue = 360f,
+            animationSpec = infiniteRepeatable(tween(6000, easing = LinearEasing), RepeatMode.Restart),
+            label = "spin"
+        )
+    } else null
     val surfaceColor = MaterialTheme.colorScheme.surfaceContainerHighest
     val iconTint = if (state == EngineState.IDLE) MaterialTheme.colorScheme.onSurfaceVariant else Color.White
 
@@ -76,9 +78,11 @@ fun VoiceOrb(
             val center = Offset(this.size.width / 2f, this.size.height / 2f)
             val base = this.size.minDimension / 2f
             val coreRadius = base * 0.42f
+            val level = levelState.value
 
             // 外层：三道相位不同的呼吸环
             if (active) {
+                val breath = breathState?.value ?: 0f
                 val breathAmp = when (state) {
                     EngineState.WAITING_WAKEWORD -> 0.06f
                     EngineState.THINKING_AI -> 0.10f
@@ -101,7 +105,8 @@ fun VoiceOrb(
             }
 
             // 思考态：旋转的弧线
-            if (state == EngineState.THINKING_AI || state == EngineState.PROCESSING_FINAL) {
+            if (spinning) {
+                val spin = spinState?.value ?: 0f
                 val arcRadius = coreRadius + base * 0.16f
                 drawArc(
                     brush = Brush.sweepGradient(listOf(accent.copy(alpha = 0f), accent), center),
@@ -166,16 +171,20 @@ fun LevelBars(
     modifier: Modifier = Modifier,
     barCount: Int = 5
 ) {
-    val transition = rememberInfiniteTransition(label = "bars")
-    val t by transition.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(tween(900, easing = LinearEasing), RepeatMode.Restart),
-        label = "barsPhase"
-    )
-    val smooth by animateFloatAsState(level, spring(stiffness = 800f), label = "barsLevel")
+    val phaseState = if (active) {
+        val transition = rememberInfiniteTransition(label = "bars")
+        transition.animateFloat(
+            initialValue = 0f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(tween(900, easing = LinearEasing), RepeatMode.Restart),
+            label = "barsPhase"
+        )
+    } else null
+    val smoothState = animateFloatAsState(if (active) level else 0f, spring(stiffness = 800f), label = "barsLevel")
 
     Canvas(modifier = modifier) {
+        val t = phaseState?.value ?: 0f
+        val smooth = smoothState.value
         val gap = size.width * 0.12f
         val barWidth = (size.width - gap * (barCount - 1)) / barCount
         for (i in 0 until barCount) {

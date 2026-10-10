@@ -5,6 +5,9 @@ import com.voice.actonsay.bridge.BridgeClient
 import com.voice.actonsay.bridge.BridgeException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
@@ -112,37 +115,110 @@ class ExtensionCatalog(val summary: String, val tools: Map<String, AgentTool>)
 
 /** 每个任务只加载扩展目录；Skill 正文通过 read_skill 按需加载。 */
 object BridgeExtensionCatalog {
+    private const val BASE_SUMMARY = "Linux自动化使用 run_debian；任务产物写入 ACTONSAY_ARTIFACT_DIR。\n"
+    private const val CACHE_TTL_MS = 60_000L
+    private const val UNREACHABLE_TTL_MS = 15_000L
+
+    private data class CacheKey(val baseUrl: String, val token: String, val debianAllowed: Boolean)
+    private data class CacheEntry(val key: CacheKey, val catalog: ExtensionCatalog, val expiresAt: Long, val reachable: Boolean)
+
+    @Volatile private var cached: CacheEntry? = null
+
+    fun invalidate() {
+        cached = null
+    }
+
+    fun markReachable() {
+        val current = cached
+        if (current != null && !current.reachable) cached = null
+    }
+
     suspend fun prepare(taskId: String): ExtensionCatalog {
-        val snapshot = LinkedHashMap<String, AgentTool>()
-        val summary = StringBuilder("Linux自动化使用 run_debian；任务产物写入 ACTONSAY_ARTIFACT_DIR。\n")
-        runCatching {
-            val services = BridgeClient.request("GET", "/v1/mcp").optJSONArray("servers") ?: JSONArray()
-            for (index in 0 until services.length()) {
-                val server = services.getJSONObject(index)
-                if (!server.optBoolean("enabled", true)) continue
-                val id = server.getString("id")
-                if (AsrManager.state.value.debianExecutionAllowed) runCatching {
-                    val tools = BridgeClient.request("GET", "/v1/mcp/${pathSegment(id)}/tools").optJSONArray("tools") ?: JSONArray()
-                    for (toolIndex in 0 until tools.length()) {
-                        val tool = tools.getJSONObject(toolIndex)
-                        val bridged = McpBridgeTool(id, tool.getString("name"), tool.optString("qualified_name"),
-                            tool.optString("description"), tool.optJSONObject("inputSchema") ?: schemaObject())
-                        snapshot[bridged.name] = bridged
+        val state = AsrManager.state.value
+        if (state.bridgeToken.isBlank() || state.bridgeBaseUrl.isBlank()) {
+            return ExtensionCatalog(BASE_SUMMARY, emptyMap())
+        }
+        val key = CacheKey(state.bridgeBaseUrl, state.bridgeToken, state.debianExecutionAllowed)
+        val now = System.currentTimeMillis()
+        cached?.let { entry ->
+            if (entry.key == key && now < entry.expiresAt) return entry.catalog
+        }
+        return coroutineScope {
+            val mcpDeferred = async {
+                try {
+                    val services = BridgeClient.request("GET", "/v1/mcp").optJSONArray("servers") ?: JSONArray()
+                    val enabledIds = buildList {
+                        for (index in 0 until services.length()) {
+                            val server = services.getJSONObject(index)
+                            if (server.optBoolean("enabled", true)) add(server.getString("id"))
+                        }
                     }
+                    val toolsByServer = if (key.debianAllowed && enabledIds.isNotEmpty()) {
+                        enabledIds.map { id ->
+                            async {
+                                id to try {
+                                    val tools = BridgeClient.request("GET", "/v1/mcp/${pathSegment(id)}/tools").optJSONArray("tools") ?: JSONArray()
+                                    buildList<AgentTool> {
+                                        for (toolIndex in 0 until tools.length()) {
+                                            val tool = tools.getJSONObject(toolIndex)
+                                            add(McpBridgeTool(id, tool.getString("name"), tool.optString("qualified_name"),
+                                                tool.optString("description"), tool.optJSONObject("inputSchema") ?: schemaObject()))
+                                        }
+                                    }
+                                } catch (cancelled: CancellationException) {
+                                    throw cancelled
+                                } catch (_: Exception) {
+                                    emptyList<AgentTool>()
+                                }
+                            }
+                        }.awaitAll().toMap()
+                    } else emptyMap<String, List<AgentTool>>()
+                    val snapshot = LinkedHashMap<String, AgentTool>()
+                    val mcpSummary = StringBuilder()
+                    for (id in enabledIds) {
+                        toolsByServer[id]?.forEach { bridged -> snapshot[bridged.name] = bridged }
+                        mcpSummary.append("MCP服务：").append(id).append("，工具可用mcp_tool查询并调用，资源和提示可按需查询。\n")
+                    }
+                    Triple(true, mcpSummary.toString(), snapshot as Map<String, AgentTool>)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    Triple(false, "", emptyMap())
                 }
-                summary.append("MCP服务：").append(id).append("，工具可用mcp_tool查询并调用，资源和提示可按需查询。\n")
             }
-        }
-        runCatching {
-            val skills = BridgeClient.request("GET", "/v1/skills").optJSONArray("skills") ?: JSONArray()
-            summary.append("可用Skills（仅名称说明；用户指定或与目标匹配时先read_skill读取SKILL.md，再按正文执行）：\n")
-            for (index in 0 until skills.length()) {
-                val skill = skills.getJSONObject(index)
-                if (skill.optBoolean("enabled", true)) summary.append(skill.getString("id")).append(" / ")
-                    .append(skill.optString("name")).append(": ").append(skill.optString("description").take(1000)).append('\n')
+            val skillsDeferred = async {
+                try {
+                    val skills = BridgeClient.request("GET", "/v1/skills").optJSONArray("skills") ?: JSONArray()
+                    val skillsSummary = StringBuilder("可用Skills（仅名称说明；用户指定或与目标匹配时先read_skill读取SKILL.md，再按正文执行）：\n")
+                    for (index in 0 until skills.length()) {
+                        val skill = skills.getJSONObject(index)
+                        if (skill.optBoolean("enabled", true)) skillsSummary.append(skill.getString("id")).append(" / ")
+                            .append(skill.optString("name")).append(": ").append(skill.optString("description").take(1000)).append('\n')
+                    }
+                    true to skillsSummary.toString()
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    false to ""
+                }
             }
+            val (mcpOk, mcpText, snapshot) = mcpDeferred.await()
+            val (skillsOk, skillsText) = skillsDeferred.await()
+            val summary = buildString {
+                append(BASE_SUMMARY)
+                append(mcpText)
+                append(skillsText)
+            }
+            val reachable = mcpOk || skillsOk
+            val catalog = ExtensionCatalog(summary, snapshot)
+            cached = CacheEntry(
+                key = key,
+                catalog = catalog,
+                expiresAt = System.currentTimeMillis() + if (reachable) CACHE_TTL_MS else UNREACHABLE_TTL_MS,
+                reachable = reachable
+            )
+            catalog
         }
-        return ExtensionCatalog(summary.toString(), snapshot)
     }
 }
 

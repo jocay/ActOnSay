@@ -42,6 +42,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -142,6 +143,7 @@ fun HomeScreen(
     val audioLevel by AsrManager.audioLevel.collectAsState()
     val conversations by AsrManager.conversations.collectAsState()
     val tasks by TaskRuntime.tasks.collectAsState()
+    val tasksById = remember(tasks) { tasks.associateBy { it.id } }
     val pendingTurns = remember(tasks, asrState.conversationId) { AsrManager.pendingTurns(tasks) }
     val conversationTitle = conversations.firstOrNull { it.id == asrState.conversationId }?.title ?: "新对话"
 
@@ -398,13 +400,14 @@ fun HomeScreen(
                             textAlign = androidx.compose.ui.text.style.TextAlign.Center
                         )
                     }
-                    items(asrState.messages, key = { it.id }) { msg ->
+                    itemsIndexed(asrState.messages, key = { _, it -> it.id }) { idx, msg ->
                         val prevUser = if (msg.role == "assistant") {
-                            val idx = asrState.messages.indexOf(msg)
                             asrState.messages.getOrNull(idx - 1)?.takeIf { it.role == "user" }
                         } else null
+                        val task = if (msg.role == "assistant" && msg.taskId.isNotBlank()) tasksById[msg.taskId] else null
                         ChatBubble(
                             message = msg,
+                            task = task,
                             onReplayTts = { AsrManager.replayMessage(msg.content) },
                             onCopyText = { copy(msg.content) },
                             onShare = { share(msg.content) },

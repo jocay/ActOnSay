@@ -49,6 +49,7 @@ import androidx.compose.ui.unit.dp
 import com.voice.actonsay.asr.AsrManager
 import com.voice.actonsay.asr.ChatMessage
 import com.voice.actonsay.ui.icons.AppIcons
+import com.voice.actonsay.tasks.TaskRecord
 import com.voice.actonsay.tasks.TaskRuntime
 import com.voice.actonsay.ui.screens.TaskCard
 import androidx.compose.material3.TextButton
@@ -60,6 +61,7 @@ import java.util.Locale
 @Composable
 fun ChatBubble(
     message: ChatMessage,
+    task: TaskRecord? = null,
     onReplayTts: () -> Unit,
     onCopyText: () -> Unit,
     onShare: () -> Unit,
@@ -233,11 +235,9 @@ fun ChatBubble(
             }
         }
 
-        if (!isUser && message.taskId.isNotBlank()) {
-            val tasks by TaskRuntime.tasks.collectAsState()
-            tasks.firstOrNull { it.id == message.taskId }?.let { task ->
-                val needsAttention = task.state in setOf("WAITING_CONFIRMATION", "RESULT_UNKNOWN", "WAITING_APP")
-                if (task.visible || needsAttention) {
+        if (!isUser && task != null) {
+            val needsAttention = task.state in setOf("WAITING_CONFIRMATION", "RESULT_UNKNOWN", "WAITING_APP")
+            if (task.visible || needsAttention) {
                     // 后台任务，或需要用户授权、核实的回合：直接展示任务卡片。
                     Spacer(Modifier.height(6.dp))
                     TaskCard(task, compact = true)
@@ -265,7 +265,6 @@ fun ChatBubble(
                             TaskCard(task, compact = true)
                         }
                     }
-                }
             }
         }
 

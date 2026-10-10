@@ -1,5 +1,6 @@
 package com.voice.actonsay.bridge
 
+import com.voice.actonsay.agent.tools.BridgeExtensionCatalog
 import com.voice.actonsay.asr.AsrManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -51,6 +52,10 @@ object BridgeClient {
             if (!response.isSuccessful) {
                 val detail = result.optString("message").ifBlank { result.opt("detail")?.toString().orEmpty() }.take(400)
                 throw BridgeException(response.code, result.optString("error_type", "bridge_error"), detail.ifBlank { "执行服务请求失败" })
+            }
+            BridgeExtensionCatalog.markReachable()
+            if (method !in setOf("GET", "HEAD") && (path.startsWith("/v1/mcp") || path.startsWith("/v1/skills"))) {
+                BridgeExtensionCatalog.invalidate()
             }
             result
         }

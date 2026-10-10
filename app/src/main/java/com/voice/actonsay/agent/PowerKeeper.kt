@@ -9,8 +9,10 @@ import android.util.Log
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.sync.Mutex
@@ -30,7 +32,7 @@ object PowerKeeper {
     private var appContext: Context? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var receiver: BroadcastReceiver? = null
-
+    private var keepAliveJob: Job? = null
     /** 面板被我们断电中。 */
     @Volatile private var panelForcedOff = false
     /** 临时会话是我们把休眠的设备唤醒的，结束时要睡回去。 */
@@ -124,11 +126,15 @@ object PowerKeeper {
                 if (enabled) {
                     goDark()
                     keepAlive()
-                } else if (!sessionActive) {
-                    releaseLock()
-                    if (panelForcedOff) {
-                        panelForcedOff = false
-                        runCatching { root("cmd display power-reset 0; input keyevent KEYCODE_SLEEP") }
+                } else {
+                    keepAliveJob?.cancel()
+                    keepAliveJob = null
+                    if (!sessionActive) {
+                        releaseLock()
+                        if (panelForcedOff) {
+                            panelForcedOff = false
+                            runCatching { root("cmd display power-reset 0; input keyevent KEYCODE_SLEEP") }
+                        }
                     }
                 }
             }
@@ -137,8 +143,9 @@ object PowerKeeper {
 
     /** 常驻模式下定期续上唤醒锁。 */
     private fun keepAlive() {
-        scope.launch {
-            while (always) {
+        if (keepAliveJob?.isActive == true) return
+        keepAliveJob = scope.launch {
+            while (isActive && always) {
                 delay(10 * 60_000L)
                 if (always) mutex.withLock { holdLock() }
             }
