@@ -154,6 +154,8 @@ data class AsrState(
     // 外观与行为
     val themeMode: ThemeMode = ThemeMode.SYSTEM,
     val dynamicColor: Boolean = false,
+    val avatarStyle: AvatarStyle = AvatarStyle.OUO,
+    val ouoSensorEnabled: Boolean = true,
     val autoStartOnLaunch: Boolean = false,
     val keepScreenOn: Boolean = false,
 
@@ -214,6 +216,8 @@ object AsrManager {
 
     private const val KEY_THEME_MODE = "theme_mode"
     private const val KEY_DYNAMIC_COLOR = "dynamic_color"
+    private const val KEY_AVATAR_STYLE = "avatar_style"
+    private const val KEY_OUO_SENSOR = "ouo_sensor_enabled"
     private const val KEY_AUTO_START = "auto_start"
     private const val KEY_KEEP_SCREEN_ON = "keep_screen_on"
     private const val KEY_WAKE_COUNT = "stat_wake_count"
@@ -307,7 +311,9 @@ object AsrManager {
             val savedThemeMode = runCatching {
                 ThemeMode.valueOf(p.getString(KEY_THEME_MODE, ThemeMode.SYSTEM.name) ?: ThemeMode.SYSTEM.name)
             }.getOrDefault(ThemeMode.SYSTEM)
-
+            val savedAvatarStyle = runCatching {
+                AvatarStyle.valueOf(p.getString(KEY_AVATAR_STYLE, AvatarStyle.OUO.name) ?: AvatarStyle.OUO.name)
+            }.getOrDefault(AvatarStyle.OUO)
             val savedMimoKey = readCredential(KEY_MIMO_API_KEY)
             val savedMimoVoice = p.getString(KEY_MIMO_VOICE, MimoTtsClient.DEFAULT_VOICE) ?: MimoTtsClient.DEFAULT_VOICE
             val savedMimoStyle = p.getString(KEY_MIMO_STYLE, "") ?: ""
@@ -369,6 +375,8 @@ object AsrManager {
                 ttsPitch = savedTtsPitch,
                 themeMode = savedThemeMode,
                 dynamicColor = p.getBoolean(KEY_DYNAMIC_COLOR, false),
+                avatarStyle = savedAvatarStyle,
+                ouoSensorEnabled = p.getBoolean(KEY_OUO_SENSOR, true),
                 autoStartOnLaunch = p.getBoolean(KEY_AUTO_START, false),
                 keepScreenOn = p.getBoolean(KEY_KEEP_SCREEN_ON, false),
                 totalWakeCount = p.getInt(KEY_WAKE_COUNT, 0),
@@ -756,6 +764,7 @@ object AsrManager {
             .put("播报", JSONObject().put("enabled", st.ttsEnabled).put("engine", st.ttsEngine.name).put("mimoVoice", st.mimoVoice)
                 .put("mimoStyle", CredentialRedactor.text(st.mimoStylePrompt)).put("rate", st.ttsSpeechRate.toDouble()).put("pitch", st.ttsPitch.toDouble()))
             .put("外观与行为", JSONObject().put("theme", st.themeMode.name).put("dynamicColor", st.dynamicColor)
+                .put("avatarStyle", st.avatarStyle.name).put("ouoSensorEnabled", st.ouoSensorEnabled)
                 .put("autoStart", st.autoStartOnLaunch).put("keepScreenOn", st.keepScreenOn))
             .toString(2)
     }
@@ -1020,6 +1029,14 @@ object AsrManager {
         _state.value = _state.value.copy(themeMode = themeMode, dynamicColor = dynamicColor)
     }
 
+    @Synchronized
+    fun setAvatarConfig(style: AvatarStyle, sensorEnabled: Boolean) {
+        prefs?.edit()?.apply {
+            putString(KEY_AVATAR_STYLE, style.name)
+            putBoolean(KEY_OUO_SENSOR, sensorEnabled)
+        }?.apply()
+        _state.value = _state.value.copy(avatarStyle = style, ouoSensorEnabled = sensorEnabled)
+    }
     @Synchronized
     fun setBehavior(autoStartOnLaunch: Boolean, keepScreenOn: Boolean) {
         prefs?.edit()?.apply {

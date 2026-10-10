@@ -104,6 +104,7 @@ import androidx.core.content.ContextCompat
 import com.voice.actonsay.asr.AsrManager
 import com.voice.actonsay.asr.AsrService
 import com.voice.actonsay.asr.AsrState
+import com.voice.actonsay.asr.AvatarStyle
 import com.voice.actonsay.asr.ChatMessage
 import com.voice.actonsay.asr.EngineState
 import com.voice.actonsay.tasks.ConversationRecord
@@ -113,7 +114,9 @@ import com.voice.actonsay.tasks.TaskRecord
 import com.voice.actonsay.tasks.TaskRuntime
 import kotlinx.coroutines.delay
 import com.voice.actonsay.ui.components.ChatBubble
+import com.voice.actonsay.ui.components.KawaiiFace
 import com.voice.actonsay.ui.components.LevelBars
+import com.voice.actonsay.ui.components.OuoFullScreenDialog
 import com.voice.actonsay.ui.components.VoiceOrb
 import com.voice.actonsay.ui.components.iconForState
 import com.voice.actonsay.ui.icons.AppIcons
@@ -150,6 +153,7 @@ fun HomeScreen(
     var manualInputText by rememberSaveable { mutableStateOf("") }
     var showClearDialog by remember { mutableStateOf(false) }
     var showConversations by remember { mutableStateOf(false) }
+    var showOuoFullScreen by rememberSaveable { mutableStateOf(false) }
     var menuOpen by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
     val scrollScope = rememberCoroutineScope()
@@ -263,6 +267,18 @@ fun HomeScreen(
         onDelete = { AsrManager.deleteConversation(it) }
     )
 
+    if (showOuoFullScreen) {
+        OuoFullScreenDialog(
+            state = asrState,
+            audioLevel = audioLevel,
+            activeTask = pendingTurns.firstOrNull(),
+            onMicTap = {
+                if (!asrState.isListening) toggleStandby() else AsrManager.onMicTapped()
+            },
+            onDismiss = { showOuoFullScreen = false }
+        )
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -279,6 +295,9 @@ fun HomeScreen(
                     }
                 },
                 actions = {
+                    IconButton(onClick = { showOuoFullScreen = true }) {
+                        Icon(AppIcons.Face, contentDescription = "全屏表情模式")
+                    }
                     StandbyToggle(listening = asrState.isListening, onToggle = ::toggleStandby)
                     Spacer(Modifier.width(4.dp))
                     Box {
@@ -296,6 +315,11 @@ fun HomeScreen(
                                 text = { Text("会话列表与搜索") },
                                 leadingIcon = { Icon(AppIcons.History, null) },
                                 onClick = { menuOpen = false; showConversations = true }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("全屏 OuO 表情") },
+                                leadingIcon = { Icon(AppIcons.Face, null) },
+                                onClick = { menuOpen = false; showOuoFullScreen = true }
                             )
                             DropdownMenuItem(
                                 text = { Text("设置") },
@@ -376,8 +400,10 @@ fun HomeScreen(
                 EmptyConversation(
                     state = asrState,
                     audioLevel = audioLevel,
+                    activeTask = pendingTurns.firstOrNull(),
                     onSuggestion = { AsrManager.sendManualMessage(it) },
                     onStart = ::toggleStandby,
+                    onOpenFullScreenFace = { showOuoFullScreen = true },
                     onOpenAiSettings = onOpenAiSettings,
                     onOpenAsrSettings = onOpenAsrSettings,
                     modifier = Modifier.weight(1f)
@@ -632,8 +658,10 @@ private fun LiveTranscriptBubble(text: String) {
 private fun EmptyConversation(
     state: AsrState,
     audioLevel: Float,
+    activeTask: TaskRecord?,
     onSuggestion: (String) -> Unit,
     onStart: () -> Unit,
+    onOpenFullScreenFace: () -> Unit,
     onOpenAiSettings: () -> Unit,
     onOpenAsrSettings: () -> Unit,
     modifier: Modifier = Modifier
@@ -645,8 +673,17 @@ private fun EmptyConversation(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        VoiceOrb(state = state.engineState, audioLevel = audioLevel, size = 180.dp)
-        Spacer(Modifier.height(24.dp))
+        if (state.avatarStyle == AvatarStyle.OUO) {
+            KawaiiFace(
+                state = state,
+                audioLevel = audioLevel,
+                activeTask = activeTask,
+                onCenterTap = onOpenFullScreenFace
+            )
+        } else {
+            VoiceOrb(state = state.engineState, audioLevel = audioLevel, size = 180.dp)
+        }
+        Spacer(Modifier.height(20.dp))
         Text(
             text = when (state.engineState) {
                 EngineState.IDLE -> "你好，我是你的语音助手"

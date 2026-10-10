@@ -133,7 +133,7 @@ fun SettingsHubScreen(onOpen: (SettingsPage) -> Unit) {
             SectionCard(title = "通用") {
                 SettingNavRow(
                     title = "外观与行为",
-                    subtitle = "主题、动态取色、自动待机、屏幕常亮",
+                    subtitle = "主题、OuO 互动表情、自动待机、屏幕常亮",
                     icon = AppIcons.Palette,
                     onClick = { onOpen(SettingsPage.APPEARANCE) }
                 )
